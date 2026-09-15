@@ -1,40 +1,83 @@
+
+
+
+# Python 3.9+
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# tkinter is NOT a pip package - it comes from your Python install:
+#   - python.org Windows/macOS installers: included by default
+#   - Anaconda/Miniconda: included
+#   - Debian/Ubuntu:  sudo apt install python3-tk
+#   - Fedora/RHEL:    sudo dnf install python3-tkinter
+#   - Arch:           sudo pacman -S tk
+#   - macOS Homebrew: brew install python-tk
+# Verify with:  python -c "import tkinter"
+ 
+rasterio>=1.3
+numpy>=1.24
+Pillow>=9.0
+
+GeoTIFF Object Overlay
+
+Place PNG object templates on a GeoTIFF and export a new GeoTIFF. CRS, transform, nodata and extra bands are preserved.
+
+Install
+bash
+pip install -r requirements.txt
+
+tkinter comes with python.org / Anaconda installs. On Linux add it separately: sudo apt install python3-tk (Debian/Ubuntu) or sudo dnf install python3-tkinter (Fedora). Verify: python -c "import tkinter"
+
+Run
+
+F5 in Spyder or python geotiff_overlay_gui.py. Under Spyder it opens in a separate process; if no window appears, read gui_launch.log next to the script.
+
+Use
+Load GeoTIFF
+Add PNG template - draw a polygon around the object (right-click undo, wheel zoom, right-drag pan)
+Place it: drag to move, Ctrl+wheel scale, Shift+wheel rotate. Metre dimensions show on the object; Width (m) sets exact size, Measure (m) gives distance + bearing from the imagery.
+Check the Native footprint panel - that is what gets written.
+Export GeoTIFF (placements saved to a .json sidecar, reloadable).
+
+Tones: leave on match local background; slider ~150 = realistic pop. Output grid auto (template GSD) + chip around objects keeps the template at full resolution without a huge file.
+
+
+
+
+
+
+
+
+
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-geotiff_overlay_gui.py
-======================
+geotiff_overlay_gui.py - place PNG object templates on a GeoTIFF, export a
+new GeoTIFF (CRS / transform / nodata / extra bands preserved).
 
-Desktop GUI for placing PNG "template" objects onto a GeoTIFF and exporting a
-new, fully georeferenced GeoTIFF.
+INSTALL   pip install rasterio numpy Pillow     (tkinter ships with Anaconda)
 
-Workflow
---------
-1.  Load GeoTIFF          -> displayed as a stretched preview
-2.  Add PNG template      -> opens the template editor
-3.  In the editor: draw a polygon around the object (everything outside becomes
-    transparent) and/or click a background colour to knock out.  Choose the
-    colour mode: original / grayscale / black & white.
-4.  Back in the main window: drag the object into place, then rotate / scale /
-    set opacity.  Zoom in to fine-tune the fit against the imagery.
-5.  Export GeoTIFF        -> full-resolution composite, CRS + transform + all
-    non-display bands preserved from the source file.
+RUN       F5 in Spyder or: python geotiff_overlay_gui.py
+          Under Spyder it launches as a separate process; if no window
+          appears, read gui_launch.log next to this file.
+          RUN.GEOTIFF / RUN.TEMPLATE below can pre-load files.
 
-View controls
--------------
-    wheel                 zoom in / out about the cursor
-    Ctrl + wheel          scale the selected object
-    Shift + wheel         rotate the selected object
-    right- or middle-drag pan
-    left-drag             move the selected object
-    arrow keys            nudge the object by one raster pixel
-    Delete                remove the selected object
+USE       1. Load GeoTIFF
+          2. Add PNG template -> draw a polygon around the object
+             (right-click undo, wheel zoom, right-drag pan)
+          3. Place: drag = move, Ctrl+wheel = scale, Shift+wheel = rotate,
+             arrows = nudge, Delete = remove. Metre dimensions show on the
+             object; Width (m) sets exact size; Measure (m) reads distance
+             and bearing off the imagery.
+          4. Native footprint panel = exactly what gets written.
+          5. Export GeoTIFF (placements go to a reloadable .json sidecar).
 
-Zoom past the preview resolution reads fresh pixels from the source file, so
-what you see when fitting an object is true full-resolution imagery.
-
-Requires: rasterio, numpy, pillow  (tkinter ships with Anaconda)
-
-Run:  python geotiff_overlay_gui.py      (or just F5 in Spyder)
+TONES     keep "match local background"; slider ~150 = realistic pop.
+          Output grid "auto (template GSD)" + "chip around objects" keeps
+          the template at full resolution without a huge file.
 """
 
 import os
@@ -1275,6 +1318,8 @@ class App(tk.Tk):
         self.e_m.bind("<Return>", lambda e: self.on_entry("metres"))
         ttk.Button(r, text="Native 1:1", width=10, command=self.native_size
                    ).pack(side="left", padx=4)
+        self.lbl_objdims = ttk.Label(f, text="-", foreground="#666")
+        self.lbl_objdims.pack(anchor="w", pady=(3, 0))
 
         r = ttk.Frame(f)
         r.pack(fill="x", pady=(6, 0))
@@ -1643,6 +1688,12 @@ class App(tk.Tk):
             if self.info:
                 mpp = self.mpp()
                 self._set(self.e_m, "%.2f" % (ov.src.width * ov.scale * mpp))
+                self.lbl_objdims.config(
+                    text="object: %.2f x %.2f m  (%.0f x %.0f raster px)"
+                         % (ov.src.width * ov.scale * mpp,
+                            ov.src.height * ov.scale * mpp,
+                            ov.src.width * ov.scale,
+                            ov.src.height * ov.scale))
         self._suspend = False
 
     @staticmethod
@@ -1670,8 +1721,15 @@ class App(tk.Tk):
             self.lbl_sharp.config(text="%d" % int(ov.sharpen))
             self.lbl_thresh.config(text="%d" % int(ov.thresh))
             if self.info:
+                mpp = self.mpp()
                 self._set(self.e_m,
-                          "%.2f" % (ov.src.width * ov.scale * self.mpp()))
+                          "%.2f" % (ov.src.width * ov.scale * mpp))
+                self.lbl_objdims.config(
+                    text="object: %.2f x %.2f m  (%.0f x %.0f raster px)"
+                         % (ov.src.width * ov.scale * mpp,
+                            ov.src.height * ov.scale * mpp,
+                            ov.src.width * ov.scale,
+                            ov.src.height * ov.scale))
         finally:
             self._suspend = False
 
@@ -2252,13 +2310,36 @@ class App(tk.Tk):
         self._tkimg = ImageTk.PhotoImage(comp)
         self.canvas.create_image(0, 0, anchor="nw", image=self._tkimg)
         if self.sel:
-            l, t, r, b = self.sel.bbox(view=self.ds)
-            dx, dy = self.ox * self.ds, self.oy * self.ds
-            self.canvas.create_rectangle(l - dx, t - dy, r - dx, b - dy,
-                                         outline="#00e0ff", dash=(4, 3))
-            cx, cy = self.raster_to_canvas(self.sel.cx, self.sel.cy)
+            ov = self.sel
+            cx, cy = self.raster_to_canvas(ov.cx, ov.cy)
+            # oriented rectangle following the object's own edges
+            w2 = ov.src.width * ov.scale * self.ds / 2.0
+            h2 = ov.src.height * ov.scale * self.ds / 2.0
+            th = math.radians(ov.rot)
+            co, si = math.cos(th), math.sin(th)
+
+            def rp(dx_, dy_):
+                # CCW-visual rotation in screen coords (y down)
+                return (cx + dx_ * co + dy_ * si, cy - dx_ * si + dy_ * co)
+
+            p0, p1 = rp(-w2, -h2), rp(w2, -h2)
+            p2, p3 = rp(w2, h2), rp(-w2, h2)
+            self.canvas.create_polygon(*(p0 + p1 + p2 + p3), fill="",
+                                       outline="#00e0ff", dash=(4, 3), width=1)
             self.canvas.create_line(cx - 6, cy, cx + 6, cy, fill="#00e0ff")
             self.canvas.create_line(cx, cy - 6, cx, cy + 6, fill="#00e0ff")
+
+            # live dimensions in metres, pinned to the object's edges
+            mpp = self.mpp()
+            Lm = ov.src.width * ov.scale * mpp    # along the template's width
+            Wm = ov.src.height * ov.scale * mpp   # along its height
+            for (a, b2), dim in (((p0, p1), Lm), ((p1, p2), Wm)):
+                mx, my = (a[0] + b2[0]) / 2.0, (a[1] + b2[1]) / 2.0
+                vx, vy = mx - cx, my - cy
+                n = math.hypot(vx, vy) or 1.0
+                self._mtext(mx + vx / n * 14, my + vy / n * 14,
+                            "%.1f m" % dim, colour="#00e0ff",
+                            anchor="center")
         if self.measure_pts:
             self._draw_measure()
         if self.aoi:
@@ -2375,10 +2456,10 @@ class App(tk.Tk):
         self.lbl_fp.config(text=txt,
                            foreground="#a33" if eff < 0.98 else "#2a7")
 
-    def _mtext(self, x, y, text):
-        self.canvas.create_text(x + 1, y + 1, anchor="w", fill="#000000",
+    def _mtext(self, x, y, text, colour="#ff9f40", anchor="w"):
+        self.canvas.create_text(x + 1, y + 1, anchor=anchor, fill="#000000",
                                 text=text, font=("TkDefaultFont", 8))
-        self.canvas.create_text(x, y, anchor="w", fill="#ff9f40",
+        self.canvas.create_text(x, y, anchor=anchor, fill=colour,
                                 text=text, font=("TkDefaultFont", 8))
 
     def _draw_measure(self):
