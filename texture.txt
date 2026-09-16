@@ -1,12 +1,11 @@
+docker run --rm \
+  -v /home/tabtahi/SATLOCK:/home/tabtahi/SATLOCK \
+  -v /home/kashley/satlock/mosaic_datasets:/home/kashley/satlock/mosaic_datasets:ro \
+  -v /mnt/nga_storage_appliance:/mnt/nga_storage_appliance:ro \
+  -v /data3/sandbox/kashley/satlock:/data3/sandbox/kashley/satlock:ro \
+  -v $(pwd):/w:ro \
+  --entrypoint python3 rpc-ellip /w/list_fallback_scenes.py --texture
 
-# fast — just the list and reason counts
-docker run --rm -v /home/tabtahi/SATLOCK:/home/tabtahi/SATLOCK:ro -v $(pwd):/w:ro \
-  --entrypoint python3 rpc-ellip /w/list_fallback_scenes.py
-
-# with texture metrics (reads each raster, slower — try --limit 50 first)
-docker run --rm -v /home/tabtahi/SATLOCK:/home/tabtahi/SATLOCK:ro -v $(pwd):/w:ro \
-  --entrypoint python3 rpc-ellip /w/list_fallback_scenes.py \
-  --texture --csv /w/fallback_scenes.csv
 
 
 #!/usr/bin/env python3
@@ -45,6 +44,10 @@ import numpy as np
 DEF_LEARNED = "/home/tabtahi/SATLOCK/dataset/SAR_learned"
 DEF_RPC = "/home/tabtahi/SATLOCK/dataset/SAR_RPC_ellip"
 DEF_MANIFEST = "/home/tabtahi/SATLOCK/dataset/SAR_learned/scene_manifest.json"
+DEF_WV = "/data3/sandbox/kashley/satlock/data_collection/outputs/wv_dailytake_output"
+DEF_GEC = "/mnt/nga_storage_appliance/datasets/satlock/Umbra/SAR"
+DEF_GEC_FB = "/home/kashley/satlock/mosaic_datasets/eo_sar_umbra_subset_HH_unique_v2/SAR"
+DEF_OUT = "/home/tabtahi/SATLOCK/ce90_out/fallback_scenes.csv"
 
 
 def load_manifest(path):
@@ -172,6 +175,48 @@ def find_rpc(rpc_root, scene):
     return hits[0] if hits else None
 
 
+def find_fused(learned_root, scene):
+    hits = sorted(glob.glob(f"{learned_root}/{scene}/*_reg_fused.tif"))
+    return hits[0] if hits else None
+
+
+def find_wv(wv_root, scene):
+    for pat in ("mosaic/*.tif", "*.tif"):
+        hits = sorted(glob.glob(f"{wv_root}/{scene}/{pat}"))
+        if hits:
+            return hits[0]
+    return None
+
+
+def scene_uuid(rpc_root, scene):
+    p = Path(rpc_root) / scene / "uuid.txt"
+    if p.is_file():
+        try:
+            return p.read_text().strip()
+        except Exception:
+            return None
+    return None
+
+
+def find_gec(gec_root, gec_fallback, rpc_root, scene):
+    """Appliance (UUID folder) first, then the scene-named fallback root."""
+    folders = [scene]
+    u = scene_uuid(rpc_root, scene)
+    if u:
+        folders.insert(0, u)
+    folders.append(scene[:-4] if scene.endswith("_GEC") else scene + "_GEC")
+    for root in (gec_root, gec_fallback):
+        if not root:
+            continue
+        for folder in folders:
+            for pat in ("*_GEC.tif", "*.tif"):
+                hits = [h for h in glob.glob(f"{root}/{folder}/{pat}")
+                        if "dem" not in os.path.basename(h).lower()]
+                if hits:
+                    return sorted(hits)[0]
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--learned", default=DEF_LEARNED)
@@ -180,7 +225,12 @@ def main():
     ap.add_argument("--texture", action="store_true", help="compute texture metrics")
     ap.add_argument("--all-scenes", action="store_true",
                     help="include fused scenes too (for comparison)")
-    ap.add_argument("--csv", help="write full table here")
+    ap.add_argument("--wv", default=DEF_WV)
+    ap.add_argument("--gec", default=DEF_GEC)
+    ap.add_argument("--gec-fallback", default=DEF_GEC_FB)
+    ap.add_argument("--csv", default=DEF_OUT,
+                    help=f"output CSV path (default: {DEF_OUT})")
+    ap.add_argument("--no-csv", action="store_true", help="skip writing the CSV")
     ap.add_argument("--limit", type=int, help="stop after N scenes (testing)")
     ap.add_argument("--sort", default="struct",
                     choices=["struct", "grad", "std", "entropy", "flat_frac", "scene"],
@@ -208,9 +258,20 @@ def main():
         rec = by_id.get(scene, {})
         n_roma, ex_roma = match_count(args.learned, scene, "roma")
         n_xoftr, ex_xoftr = match_count(args.learned, scene, "xoftr")
+        rpc_path = find_rpc(args.rpc, scene)
+        fused_path = find_fused(args.learned, scene)
+        wv_path = find_wv(args.wv, scene)
+        gec_path = find_gec(args.gec, args.gec_fallback, args.rpc, scene)
         row = {
             "scene": scene,
             "fused": is_fused,
+            "gec_file": os.path.basename(gec_path) if gec_path else "",
+            "gec_path": gec_path or "",
+            "rpc_ellip_file": os.path.basename(rpc_path) if rpc_path else "",
+            "rpc_ellip_path": rpc_path or "",
+            "wv_path": wv_path or "",
+            "fused_path": fused_path or "",
+            "uuid": scene_uuid(args.rpc, scene) or "",
             "reason": (rec.get("fallback_reason") or fb.get("reason")
                        or ("" if is_fused else "unknown")),
             "decision": rec.get("decision") or fb.get("decision") or "",
@@ -219,8 +280,7 @@ def main():
             "exhausted": ex_roma or ex_xoftr,
         }
         if args.texture:
-            p = find_rpc(args.rpc, scene)
-            t = texture(p) if p else None
+            t = texture(rpc_path) if rpc_path else None
             row.update(t or {"valid_frac": None, "struct": None, "std": None,
                              "grad": None, "entropy": None, "flat_frac": None})
         rows.append(row)
@@ -286,11 +346,33 @@ def main():
                 print(f"    {(reason or '(none)')[:38]:38s} "
                       f"{np.median(vals):.3f}  (n={len(vals)})")
 
-    if args.csv:
-        with open(args.csv, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader(); w.writerows(rows)
-        print(f"\nwrote -> {args.csv}  ({len(rows)} rows)")
+    if not args.no_csv and args.csv:
+        outp = Path(args.csv)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        # lowest-texture first when we have the metric, else by scene
+        ordered = rows
+        if args.texture:
+            with_t = [r for r in rows if r.get("struct") is not None]
+            without = [r for r in rows if r.get("struct") is None]
+            ordered = sorted(with_t, key=lambda r: r["struct"]) + without
+        with open(outp, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(ordered[0].keys()))
+            w.writeheader(); w.writerows(ordered)
+        print(f"\nwrote -> {outp}  ({len(ordered)} rows"
+              f"{', lowest-texture first' if args.texture else ''})")
+
+        n_missing = sum(1 for r in rows if not r["rpc_ellip_path"])
+        if n_missing:
+            print(f"  note: {n_missing} scenes had no RPC-ellipsoid raster "
+                  f"(no texture metrics for those)")
+
+        # a plain filename list is handy for feeding other tools
+        txt = outp.with_suffix(".paths.txt")
+        with open(txt, "w") as f:
+            for r in ordered:
+                if r["rpc_ellip_path"]:
+                    f.write(r["rpc_ellip_path"] + "\n")
+        print(f"wrote -> {txt}  (RPC-ellipsoid paths, one per line)")
 
 
 if __name__ == "__main__":
