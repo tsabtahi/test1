@@ -1,0 +1,297 @@
+
+# fast — just the list and reason counts
+docker run --rm -v /home/tabtahi/SATLOCK:/home/tabtahi/SATLOCK:ro -v $(pwd):/w:ro \
+  --entrypoint python3 rpc-ellip /w/list_fallback_scenes.py
+
+# with texture metrics (reads each raster, slower — try --limit 50 first)
+docker run --rm -v /home/tabtahi/SATLOCK:/home/tabtahi/SATLOCK:ro -v $(pwd):/w:ro \
+  --entrypoint python3 rpc-ellip /w/list_fallback_scenes.py \
+  --texture --csv /w/fallback_scenes.csv
+
+
+#!/usr/bin/env python3
+"""
+list_fallback_scenes.py — scenes where the fused product was NOT used, with
+fallback reason, matcher counts, and texture metrics.
+
+The point: "not fused" and "low texture" overlap but are not the same thing.
+A scene can fall back because the matchers disagreed (plenty of texture, bad
+geometry) or because there was nothing to match on (low texture). This lists
+every non-fused scene and measures texture so you can tell which is which.
+
+Texture metrics, computed on a decimated read of the RPC-ellipsoid product
+over valid (non-zero) pixels only:
+  std          intensity standard deviation after a 2-98 percentile stretch
+  grad         mean Sobel-ish gradient magnitude — the most direct proxy for
+               "are there edges a matcher could lock onto"
+  entropy      Shannon entropy of the 64-bin intensity histogram
+  flat_frac    fraction of 16x16 blocks whose variance is near zero
+  valid_frac   fraction of the raster that is not nodata (ocean/edge fill)
+
+Low grad + high flat_frac = genuinely featureless (open water, desert, dense
+uniform canopy). Those are the scenes worth pulling out.
+
+Usage:
+  python3 list_fallback_scenes.py                        # list only, fast
+  python3 list_fallback_scenes.py --texture              # add metrics (slower)
+  python3 list_fallback_scenes.py --texture --all-scenes # include fused scenes too
+  python3 list_fallback_scenes.py --texture --csv out.csv
+"""
+import argparse, csv, glob, json, os, sys
+from pathlib import Path
+
+import numpy as np
+
+DEF_LEARNED = "/home/tabtahi/SATLOCK/dataset/SAR_learned"
+DEF_RPC = "/home/tabtahi/SATLOCK/dataset/SAR_RPC_ellip"
+DEF_MANIFEST = "/home/tabtahi/SATLOCK/dataset/SAR_learned/scene_manifest.json"
+
+
+def load_manifest(path):
+    if not os.path.isfile(path):
+        return []
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = (data["scenes"] if "scenes" in data and isinstance(data["scenes"], list)
+                else [{**v, "scene": v.get("scene", k)} for k, v in data.items()])
+    return [r for r in data if isinstance(r, dict) and r.get("scene")]
+
+
+def read_json(p):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return {}
+
+
+def match_count(learned_root, scene, matcher):
+    """Prefer report.json; fall back to counting matches.csv lines."""
+    rep = read_json(Path(learned_root) / scene / matcher / "report.json")
+    for k in ("n_points", "points", "n_matches"):
+        if isinstance(rep.get(k), (int, float)):
+            return int(rep[k]), bool(rep.get("exhausted", False))
+    p = Path(learned_root) / scene / matcher / "matches.csv"
+    if p.is_file():
+        with open(p) as f:
+            return max(sum(1 for _ in f) - 1, 0), bool(rep.get("exhausted", False))
+    return None, bool(rep.get("exhausted", False))
+
+
+def _boxfilter(a, r):
+    """Mean over a (2r+1)^2 window via an integral image (no scipy)."""
+    pad = np.pad(a, r + 1, mode="edge")
+    ii = pad.cumsum(0).cumsum(1)
+    h, w = a.shape
+    k = 2 * r + 1
+    y0 = np.arange(h); x0 = np.arange(w)
+    Y0, X0 = np.meshgrid(y0, x0, indexing="ij")
+    A = ii[Y0, X0]
+    B = ii[Y0, X0 + k]
+    C = ii[Y0 + k, X0]
+    D = ii[Y0 + k, X0 + k]
+    return (D - B - C + A) / float(k * k)
+
+
+def texture(path, size=512, smooth_r=2):
+    """
+    Texture metrics from a decimated read.
+
+    SAR is speckle-dominated: a featureless scene still has large pixel-to-pixel
+    variation, so a raw gradient measures noise rather than matchable structure.
+    Everything below therefore separates the two by smoothing first —
+
+      struct   var(smoothed) / var(image - smoothed).  The key number: how much
+               of the scene's variance survives smoothing, i.e. is real spatial
+               structure rather than speckle. Near zero = nothing to match on.
+      grad     mean gradient magnitude OF THE SMOOTHED image (edges, not noise)
+      std      intensity std after a 2-98 stretch (kept for reference; on its
+               own it does NOT separate flat from textured in SAR)
+      entropy  Shannon entropy of the 64-bin histogram of the smoothed image
+      flat_frac fraction of 16x16 blocks whose SMOOTHED variance is ~zero
+      valid_frac fraction of the raster that is not nodata
+    """
+    import rasterio
+    from rasterio.enums import Resampling
+    try:
+        with rasterio.open(path) as ds:
+            arr = ds.read(1, out_shape=(1, min(size, ds.height), min(size, ds.width)),
+                          resampling=Resampling.average).astype(np.float32)
+    except Exception:
+        return None
+    valid = arr > 0
+    vf = float(valid.mean())
+    empty = {"valid_frac": vf, "struct": None, "grad": None, "std": None,
+             "entropy": None, "flat_frac": None}
+    if valid.sum() < 256:
+        return empty
+
+    v = arr[valid]
+    lo, hi = np.percentile(v, [2, 98])
+    if hi <= lo:
+        hi = lo + 1.0
+    norm = np.clip((arr - lo) / (hi - lo), 0, 1).astype(np.float32)
+    norm[~valid] = 0.0
+
+    sm = _boxfilter(norm, smooth_r)
+    resid = norm - sm
+
+    var_s = float(sm[valid].var())
+    var_n = float(resid[valid].var())
+    struct = float(var_s / var_n) if var_n > 1e-12 else None
+
+    gy, gx = np.gradient(sm)
+    grad = float(np.hypot(gx, gy)[valid].mean())
+
+    std = float(norm[valid].std())
+
+    hist, _ = np.histogram(sm[valid], bins=64, range=(0, 1))
+    p = hist / max(hist.sum(), 1); p = p[p > 0]
+    entropy = float(-(p * np.log2(p)).sum())
+
+    B = 16
+    h, w = sm.shape
+    hh, ww = (h // B) * B, (w // B) * B
+    flat = None
+    if hh >= B and ww >= B:
+        blocks = sm[:hh, :ww].reshape(hh//B, B, ww//B, B).transpose(0, 2, 1, 3)
+        vb = valid[:hh, :ww].reshape(hh//B, B, ww//B, B).transpose(0, 2, 1, 3)
+        keep = vb.reshape(vb.shape[0], vb.shape[1], -1).mean(axis=2) > 0.5
+        if keep.any():
+            bstd = blocks.reshape(blocks.shape[0], blocks.shape[1], -1).std(axis=2)
+            flat = float((bstd[keep] < 0.02).mean())
+
+    return {"valid_frac": vf, "struct": struct, "grad": grad, "std": std,
+            "entropy": entropy, "flat_frac": flat}
+
+
+def find_rpc(rpc_root, scene):
+    hits = sorted(glob.glob(f"{rpc_root}/{scene}/*_rpc_ellip.tif"))
+    return hits[0] if hits else None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    ap.add_argument("--learned", default=DEF_LEARNED)
+    ap.add_argument("--rpc", default=DEF_RPC)
+    ap.add_argument("--manifest", default=DEF_MANIFEST)
+    ap.add_argument("--texture", action="store_true", help="compute texture metrics")
+    ap.add_argument("--all-scenes", action="store_true",
+                    help="include fused scenes too (for comparison)")
+    ap.add_argument("--csv", help="write full table here")
+    ap.add_argument("--limit", type=int, help="stop after N scenes (testing)")
+    ap.add_argument("--sort", default="struct",
+                    choices=["struct", "grad", "std", "entropy", "flat_frac", "scene"],
+                    help="sort key when --texture is on")
+    args = ap.parse_args()
+
+    # scene universe: manifest if available, else whatever is on disk
+    recs = load_manifest(args.manifest)
+    if recs:
+        scenes = [r["scene"] for r in recs]
+        by_id = {r["scene"]: r for r in recs}
+    else:
+        scenes = sorted(p.name for p in Path(args.learned).iterdir() if p.is_dir())
+        by_id = {}
+        print(f"[warn] no manifest at {args.manifest}; scanning {args.learned}",
+              file=sys.stderr)
+
+    rows = []
+    for scene in scenes:
+        fused_tif = sorted(glob.glob(f"{args.learned}/{scene}/*_reg_fused.tif"))
+        is_fused = bool(fused_tif)
+        if is_fused and not args.all_scenes:
+            continue
+        fb = read_json(Path(args.learned) / scene / "fallback.json")
+        rec = by_id.get(scene, {})
+        n_roma, ex_roma = match_count(args.learned, scene, "roma")
+        n_xoftr, ex_xoftr = match_count(args.learned, scene, "xoftr")
+        row = {
+            "scene": scene,
+            "fused": is_fused,
+            "reason": (rec.get("fallback_reason") or fb.get("reason")
+                       or ("" if is_fused else "unknown")),
+            "decision": rec.get("decision") or fb.get("decision") or "",
+            "agreement_m": rec.get("agreement_m"),
+            "n_roma": n_roma, "n_xoftr": n_xoftr,
+            "exhausted": ex_roma or ex_xoftr,
+        }
+        if args.texture:
+            p = find_rpc(args.rpc, scene)
+            t = texture(p) if p else None
+            row.update(t or {"valid_frac": None, "struct": None, "std": None,
+                             "grad": None, "entropy": None, "flat_frac": None})
+        rows.append(row)
+        if args.limit and len(rows) >= args.limit:
+            break
+
+    if not rows:
+        print("no matching scenes")
+        return
+
+    # summary by reason
+    from collections import Counter, defaultdict
+    reasons = Counter(r["reason"] for r in rows if not r["fused"])
+    total_nonfused = sum(reasons.values())
+    print(f"\n{total_nonfused} scenes without a fused product\n")
+    print(f"  {'reason':38s} {'count':>6s}")
+    for reason, n in reasons.most_common():
+        print(f"  {(reason or '(none recorded)'):38s} {n:6d}")
+
+    if args.texture:
+        key = args.sort
+        have = [r for r in rows if r.get(key) is not None]
+        missing = [r for r in rows if r.get(key) is None]
+        have.sort(key=lambda r: r[key] if key != "scene" else r["scene"])
+        ordered = have + missing
+
+        print(f"\nlowest-texture scenes first (sorted by {key}):\n")
+        print(f"  {'scene':42s} {'struct':>7s} {'grad':>7s} {'entr':>6s} "
+              f"{'flat%':>6s} {'valid%':>7s} {'roma':>6s} {'xoftr':>6s}  reason")
+        for r in ordered[:60]:
+            f = lambda v, p=3: ("  —  " if v is None else f"{v:.{p}f}")
+            pc = lambda v: ("  —  " if v is None else f"{v*100:.0f}")
+            print(f"  {r['scene'][:42]:42s} {f(r['struct'],3):>7s} {f(r['grad'],4):>7s} "
+                  f"{f(r['entropy'],2):>6s} {pc(r['flat_frac']):>6s} "
+                  f"{pc(r['valid_frac']):>7s} "
+                  f"{str(r['n_roma'] if r['n_roma'] is not None else '—'):>6s} "
+                  f"{str(r['n_xoftr'] if r['n_xoftr'] is not None else '—'):>6s}  "
+                  f"{r['reason'][:30]}")
+        if len(ordered) > 60:
+            print(f"  ... {len(ordered)-60} more (use --csv for the full table)")
+
+        # does texture actually explain the fallbacks?
+        g = [r["struct"] for r in rows if r.get("struct") is not None and not r["fused"]]
+        gf = [r["struct"] for r in rows if r.get("struct") is not None and r["fused"]]
+        if g:
+            print(f"\n  non-fused struct ratio: median {np.median(g):.3f} (n={len(g)})")
+        if gf:
+            print(f"  fused     struct ratio: median {np.median(gf):.3f} (n={len(gf)})")
+        if g and gf:
+            print("  -> a clearly lower median for non-fused supports the "
+                  "low-texture explanation; similar medians mean texture is "
+                  "NOT what drove the fallbacks")
+
+        # texture broken out by fallback reason
+        byreason = defaultdict(list)
+        for r in rows:
+            if not r["fused"] and r.get("struct") is not None:
+                byreason[r["reason"]].append(r["struct"])
+        if len(byreason) > 1:
+            print(f"\n  median struct ratio by fallback reason:")
+            for reason, vals in sorted(byreason.items(),
+                                       key=lambda kv: np.median(kv[1])):
+                print(f"    {(reason or '(none)')[:38]:38s} "
+                      f"{np.median(vals):.3f}  (n={len(vals)})")
+
+    if args.csv:
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader(); w.writerows(rows)
+        print(f"\nwrote -> {args.csv}  ({len(rows)} rows)")
+
+
+if __name__ == "__main__":
+    main()
