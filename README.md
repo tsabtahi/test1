@@ -65,3 +65,23 @@ BLOCKS="2048" MATCHERS="xoftr" GPUS="1 1 1 1" CPUS=5 \
   nohup ./run_ablation_block.sh > logs/ablation_xoftr2048.log 2>&1 &
 sleep 60; tail -qn1 logs/abl_worker_lane*_gpu1.log; grep -c FATAL logs/abl_worker_lane*_gpu1.log
 ```
+
+
+```
+cd /home/tabtahi/SATLOCK && unzip -o gec_block_register.zip
+cd gec_block_register
+ls -la .dockerignore          # must exist, or the build ships out_height/ again
+docker build -t height-register -f Dockerfile.register .
+```
+```
+gdalinfo $(ls /data3/sandbox/kashley/satlock/data_collection/outputs/wv_dailytake_output/*/mosaic/*.tif | head -1) | grep -E "^Band|ColorInterp"
+```
+
+```
+cd /home/tabtahi/SATLOCK/gec_block_register
+docker ps | grep -c height-register                    # containers actually running
+tail -qn2 logs/abl_worker_lane*.log                    # what each lane last did
+tail -8 $(ls -t logs/abl_xoftr_b2048_*.log | head -1)  # inside the newest job
+for g in 1 2; do docker run --rm --gpus "\"device=$g\"" --entrypoint python3 height-register \
+  -c "import torch; print('gpu$g', torch.cuda.is_available(), torch.cuda.device_count())"; done
+```
