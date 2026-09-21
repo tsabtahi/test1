@@ -21,9 +21,7 @@ docker kill $(docker ps -q --filter ancestor=height-register) 2>/dev/null
 docker ps        # verify empty
 
 
-#
-#
-#
+```
 cd /home/tabtahi/SATLOCK/gec_block_register
 echo "=== alive ==="; ps aux | grep run_ablation_block | grep -v grep | wc -l          # 5 = parent + 4 lanes
 echo "=== progress ==="
@@ -36,3 +34,4 @@ echo "=== lanes ==="; tail -qn1 logs/abl_worker_lane*_gpu1.log
 echo "=== problems ==="; grep -c "FATAL\|retry" logs/abl_worker_lane*_gpu1.log; grep -l "out of memory" logs/abl_*.log 2>/dev/null | head -3
 echo "=== gpu 1 ==="; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader | sed -n 2p
 echo "=== scored? ==="; ls /home/tabtahi/SATLOCK/ce90_out/abl_block*/summary.txt 2>/dev/null
+```
