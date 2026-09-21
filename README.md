@@ -99,5 +99,25 @@ docker run --rm -v $PWD:/work --entrypoint python3 height-register -c \
 BLOCKS="2048" MATCHERS="xoftr" GPUS="1 1 1 1 2 2 2 2" CPUS=5 \
   nohup ./run_ablation_block.sh > logs/ablation_xoftr2048.log 2>&1 &
 ```
+```
   -c "import torch; print('gpu$g', torch.cuda.is_available(), torch.cuda.device_count())"; done
+```
+
+
+```
+pkill -f run_ablation_block.sh; pkill -f run_learned_dataset.sh
+docker kill $(docker ps -q --filter ancestor=height-register) 2>/dev/null
+docker ps | grep -c height-register        # 0
+
+cd /home/tabtahi/SATLOCK && unzip -o gec_block_register.zip && cd gec_block_register
+docker run --rm --entrypoint python3 height-register -c "import omnicloudmask; print('OCM ok')" \
+  || docker build -t height-register -f Dockerfile.register .
+
+gdalinfo $(ls /home/kashley/satlock/mosaic_datasets/eo_sar_umbra_subset_HH_unique_v2/wv_dailytake_output/*/mosaic/*.tif | head -1) | grep -E "^Band|ColorInterp"
+
+CLOUD=1 BLOCKS="1024" GPUS=auto LANES_PER_GPU=4 \
+  nohup ./run_ablation_block.sh > logs/ablation_b1024_cloud.log 2>&1 &
+sleep 15; head -6 logs/ablation_b1024_cloud.log
+
+
 ```
