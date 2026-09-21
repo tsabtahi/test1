@@ -35,3 +35,33 @@ echo "=== problems ==="; grep -c "FATAL\|retry" logs/abl_worker_lane*_gpu1.log; 
 echo "=== gpu 1 ==="; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader | sed -n 2p
 echo "=== scored? ==="; ls /home/tabtahi/SATLOCK/ce90_out/abl_block*/summary.txt 2>/dev/null
 ```
+
+```
+cd /home/tabtahi/SATLOCK/gec_block_register
+ps aux | grep run_ablation_block | grep -v grep | wc -l     # >0 = still running
+grep -E "matching complete|BLOCK|ablation complete" logs/ablation_block.log
+ls -la logs/abl_score_b*.log /home/tabtahi/SATLOCK/ce90_out/abl_block*/summary.txt 2>&1
+```
+
+```
+for b in 1024 2048; do
+  echo "======== BLOCK $b ========"
+  docker run --rm \
+    -v /home/tabtahi/SATLOCK/gec_block_register:/work \
+    -v /home/tabtahi/SATLOCK/ce90_out:/home/tabtahi/SATLOCK/ce90_out \
+    --entrypoint python3 height-register \
+    /work/compute_ce90_agree.py \
+      --residuals /home/tabtahi/SATLOCK/ce90_out/residuals.csv \
+      --out-root /work/out_height \
+      --roma-exp roma_b$b --xoftr-exp xoftr_b$b \
+      --medfilter-tol 10 --agree-tols 5 10 20 50 \
+      --out /home/tabtahi/SATLOCK/ce90_out/abl_block${b}_partial
+done
+```
+```
+cd /home/tabtahi/SATLOCK && unzip -o gec_block_register.zip
+cd gec_block_register
+BLOCKS="2048" MATCHERS="xoftr" GPUS="1 1 1 1" CPUS=5 \
+  nohup ./run_ablation_block.sh > logs/ablation_xoftr2048.log 2>&1 &
+sleep 60; tail -qn1 logs/abl_worker_lane*_gpu1.log; grep -c FATAL logs/abl_worker_lane*_gpu1.log
+```
