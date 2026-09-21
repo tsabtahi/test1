@@ -83,5 +83,21 @@ docker ps | grep -c height-register                    # containers actually run
 tail -qn2 logs/abl_worker_lane*.log                    # what each lane last did
 tail -8 $(ls -t logs/abl_xoftr_b2048_*.log | head -1)  # inside the newest job
 for g in 1 2; do docker run --rm --gpus "\"device=$g\"" --entrypoint python3 height-register \
+```
+
+
+```
+pkill -f run_ablation_block.sh
+docker kill $(docker ps -q --filter ancestor=height-register) 2>/dev/null
+
+cd /home/tabtahi/SATLOCK && unzip -o gec_block_register.zip && cd gec_block_register
+grep -c "max_side" matchers/__init__.py          # must be non-zero now
+
+docker run --rm -v $PWD:/work --entrypoint python3 height-register -c \
+  "import sys; sys.path.insert(0,'/work'); from matchers import XoFTRMatcher; print('xoftr max_side =', XoFTRMatcher().max_side)"
+
+BLOCKS="2048" MATCHERS="xoftr" GPUS="1 1 1 1 2 2 2 2" CPUS=5 \
+  nohup ./run_ablation_block.sh > logs/ablation_xoftr2048.log 2>&1 &
+```
   -c "import torch; print('gpu$g', torch.cuda.is_available(), torch.cuda.device_count())"; done
 ```
