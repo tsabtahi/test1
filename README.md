@@ -121,3 +121,17 @@ sleep 15; head -6 logs/ablation_b1024_cloud.log
 
 
 ```
+
+```
+cd /home/tabtahi/SATLOCK/gec_block_register
+echo "=== alive ==="; ps aux | grep run_ablation_block | grep -v grep | wc -l
+echo "=== setup ==="; head -5 logs/ablation_b1024_cloud.log
+echo "=== progress (of $(wc -l < scenes_tiepoint.txt)) ==="
+for e in roma_b1024_cloud xoftr_b1024_cloud; do echo "  $e: $(ls out_height/$e/*/report.json 2>/dev/null | wc -l)"; done
+echo "=== lanes ==="; tail -qn1 logs/abl_worker_lane*.log
+echo "=== problems ==="; grep -h "FATAL" logs/abl_worker_lane*.log; echo "retries: $(cat logs/abl_worker_lane*.log | grep -c retry)"
+grep -l "out of memory\|omnicloudmask is not installed" logs/abl_*_b1024_cloud_*.log 2>/dev/null | head -3
+echo "=== cloud filter working? ==="; grep -h "\[mask\] WV cloud\|dropped:" logs/abl_*_b1024_cloud_*.log 2>/dev/null | tail -6
+echo "=== gpus ==="; nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
+echo "=== scored? ==="; ls /home/tabtahi/SATLOCK/ce90_out/abl_block1024_cloud/summary.txt 2>/dev/null || echo "not yet"
+```
