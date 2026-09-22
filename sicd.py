@@ -885,3 +885,11 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+pip install "sarpy==2.1.1" finufft numpy scipy lxml shapely matplotlib boto3
+
+python sicd_to_cphd.py --list-pairs 10    # smallest Umbra scenes that have both SICD and CPHD
+python sicd_to_cphd.py --download auto    # download the smallest pair, convert, test
+python sicd_to_cphd.py --download 2023-11-19-16-12-16_UMBRA-05
