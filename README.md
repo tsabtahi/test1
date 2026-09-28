@@ -135,3 +135,17 @@ echo "=== cloud filter working? ==="; grep -h "\[mask\] WV cloud\|dropped:" logs
 echo "=== gpus ==="; nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
 echo "=== scored? ==="; ls /home/tabtahi/SATLOCK/ce90_out/abl_block1024_cloud/summary.txt 2>/dev/null || echo "not yet"
 ```
+
+```
+cd /home/tabtahi/SATLOCK/gec_block_register
+
+# stop the xoftr-only run if it's still going (finished scenes are kept)
+pkill -f run_learned_dataset.sh
+docker kill $(docker ps -q --filter ancestor=height-register) 2>/dev/null
+
+MATCHERS="roma xoftr" TAG="_f" BLOCK=1024 CLOUD=1 NODATA=1 GPUS=auto LANES_PER_GPU=4 \
+  nohup ./run_learned_dataset.sh > logs/learned_both_filt.log 2>&1 &
+
+sleep 20; head -6 logs/learned_both_filt.log
+
+```
