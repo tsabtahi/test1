@@ -9,6 +9,10 @@ ellipsoid height, and the image is shown and can be downloaded as a GeoTIFF.
     python cphd_viewer.py --cphd /data/scene_CPHD.cphd --port 8095         # or name the file up front
     python cphd_viewer.py --selftest                                       # synthetic end-to-end check, exits 0 on pass
 
+Extract a chip: after loading, the page shows the AOI of the CPHD. Click a point, choose a 256 x 256 or 512 x 512 pixel
+chip, and the phase history for just that lat/lon box is cut out and written as a smaller CPHD (with a JSON of its
+dimensions), shown side by side with the dimensions of the full CPHD. A CPHD can also be uploaded from the browser.
+
 How it stays fast: the collect is cut into blocks of pulses. Only blocks inside the requested window are projected,
 in parallel over worker processes, and each finished block is kept in memory and on disk. Projection is a sum over
 pulses, so any window made of finished blocks is drawn at once.
@@ -17,8 +21,10 @@ import os
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")                      # one thread per worker process; parallelism comes from the pool
 
-import argparse, hashlib, io, json, math, multiprocessing as mp, shutil, sys, threading, time, traceback
+import argparse, copy, hashlib, io, json, math, multiprocessing as mp, re, shutil, sys, threading, time, traceback
 import numpy as np
+import scipy.fft as sp_fft
+import sarkit.cphd as skcphd
 from scipy.signal.windows import taylor
 
 C = 299792458.0
@@ -73,6 +79,12 @@ class CPHD:
                 for ax in ("X", "Y"):
                     v = xml.findtext(f"{{*}}SceneCoordinates/{{*}}ImageArea/{{*}}{tag}/{{*}}{ax}")
                     area.append(float(v) if v is not None else float("nan"))
+            corners = []
+            for p in xml.findall("{*}SceneCoordinates/{*}ImageAreaCornerPoints/{*}IACP"):
+                try:
+                    corners.append((float(p.findtext("{*}Lat")), float(p.findtext("{*}Lon"))))
+                except (TypeError, ValueError):
+                    pass
             pv = r.read_pvps(self.ch)
         g = lambda k: np.ascontiguousarray(pv[k]).astype(np.float64)
         self.tx_time, self.tx_pos, self.rcv_pos, self.srp = g("TxTime"), g("TxPos"), g("RcvPos"), g("SRPPos")
@@ -110,6 +122,13 @@ class CPHD:
         stated = max(abs(area[2] - area[0]), abs(area[3] - area[1])) if np.all(np.isfinite(area)) else float("nan")
         self.scene_size_m = float(stated) if np.isfinite(stated) and 50 < stated < 1e5 else float(min(swath, 2e4))
         self.scene_size_from = "file" if np.isfinite(stated) and 50 < stated < 1e5 else "range swath"
+        if len(corners) >= 3 and np.all(np.isfinite(corners)):
+            self.aoi_corners, self.aoi_from = [list(map(float, p)) for p in corners], "corner points"
+        else:                                               # a square of the scene size around the reference point
+            w, s_, e, n = GeoGrid(self.lat0, self.lon0, self.scene_size_m, self.scene_size_m / 64, self.h0).bounds
+            self.aoi_corners, self.aoi_from = [[n, w], [n, e], [s_, e], [s_, w]], "scene size"
+        la, lo = zip(*self.aoi_corners)
+        self.aoi_bbox = [min(la), max(la), min(lo), max(lo)]               # lat_min, lat_max, lon_min, lon_max
 
     def read(self, reader, v0, v1):
         s = reader.read_signal(self.ch, start_vector=v0, stop_vector=v1)
@@ -227,6 +246,190 @@ def _task(args):
     return k, a, b, img, n
 
 
+# ------------------------------------------------------------------ bbox extraction (digital spotlighting)
+def bbox_points(bbox, h, n=11, margin=0.0):
+    """ECEF points on an n x n grid over the bbox (lat_min, lat_max, lon_min, lon_max), grown by `margin` of its size."""
+    la0, la1, lo0, lo1 = bbox
+    dla, dlo = (la1 - la0) * margin / 2, (lo1 - lo0) * margin / 2
+    lat, lon = np.meshgrid(np.linspace(la0 - dla, la1 + dla, n), np.linspace(lo0 - dlo, lo1 + dlo, n))
+    return llh_to_ecef(lat.ravel(), lon.ravel(), np.full(lat.size, h))
+
+
+def bbox_size_m(bbox):
+    la0, la1, lo0, lo1 = bbox
+    s = math.sin(math.radians(0.5 * (la0 + la1)))
+    m_lat = math.pi / 180 * _A * (1 - _E2) / (1 - _E2 * s * s) ** 1.5
+    m_lon = math.pi / 180 * _A / math.sqrt(1 - _E2 * s * s) * math.cos(math.radians(0.5 * (la0 + la1)))
+    return (lo1 - lo0) * m_lon, (la1 - la0) * m_lat              # east-west, north-south metres
+
+
+def two_way(tx, rc, p):
+    return np.linalg.norm(tx - p, axis=-1) + np.linalg.norm(rc - p, axis=-1)
+
+
+def plan_extraction(cphd, bbox, h_ref, margin=0.25, guard=0.25):
+    """Size of the bbox extract, from geometry alone (no signal is read).
+
+    Fast time: re-referenced to the bbox centre, every bbox point lies within +/-W of delay, so M ~ 2*W*bandwidth
+    frequency samples per pulse are enough. Slow time: a bbox point's phase changes by at most B_d cycles per pulse,
+    so pulses are low-pass filtered to the bbox's Doppler band and every Da-th one is kept."""
+    v0, v1 = int(cphd.good[0]), int(cphd.good[-1]) + 1
+    sl = slice(v0, v1)
+    ok = cphd.valid[sl]
+    tx, rc, srp = cphd.tx_pos[sl], cphd.rcv_pos[sl], cphd.srp[sl]
+    lat_c, lon_c = 0.5 * (bbox[0] + bbox[1]), 0.5 * (bbox[2] + bbox[3])
+    c = llh_to_ecef(lat_c, lon_c, h_ref)
+    r_c = np.where(ok, two_way(tx, rc, c), np.nan)
+    tau_c = (r_c - np.where(ok, two_way(tx, rc, srp), np.nan)) / C       # bbox centre's delay relative to each pulse's SRP
+    rel = np.stack([(np.where(ok, two_way(tx, rc, p), np.nan) - r_c) / C for p in bbox_points(bbox, h_ref, 11, margin)])
+    m = cphd.m_ref
+    N = cphd.n_hi - cphd.n_lo
+    scss = abs(cphd.scss[m])
+    W = float(np.nanmax(np.abs(rel))) + 4.0 / cphd.bandwidth            # + a few range cells for sidelobes
+    M = min(N, int(sp_fft.next_fast_len(2 * int(math.ceil(W * N * scss)))))
+    M += M % 2
+    f_hi = np.abs(cphd.sc0[sl] + (cphd.n_hi - 1) * cphd.scss[sl])
+    d = np.diff(rel * f_hi[None, :], axis=1)[:, ok[1:] & ok[:-1]]
+    B_d = float(np.nanmax(np.abs(d)))                                     # largest phase step per pulse, cycles
+    cut, stop = min(0.5, B_d * (1 + guard)), min(0.5, B_d * (1 + 2 * guard))
+    Da = max(1, int(math.floor(0.5 / stop)))
+    L = min(int(math.ceil(4.6 / max(stop - B_d, 1e-3))) | 1, (v1 - v0) // 4 | 1)   # Kaiser beta 7, about 70 dB
+    n_out = (v1 - v0 + L - 1 + Da - 1) // Da if cut < 0.5 else v1 - v0
+    idx = np.arange(n_out) * Da - ((L - 1) // 2 if cut < 0.5 else 0)
+    n_keep = int(((idx >= 0) & (idx <= v1 - v0 - 1)).sum())
+    ew, ns_ = bbox_size_m(bbox)
+    return dict(v0=v0, v1=v1, c=c, lat_c=lat_c, lon_c=lon_c, h_ref=h_ref, tau_c=tau_c, W=W, N=N, M=M, B_d=B_d, cut=cut,
+                Da=Da, L=L, n_keep=n_keep, bbox=tuple(bbox), bbox_ew_m=ew, bbox_ns_m=ns_, margin=margin,
+                exceeds_swath=W > 0.5 / scss)
+
+
+def extract_bbox(cphd, plan, chunk=256, workers=1, progress=None, cancel=None):
+    """One pass over the file: re-reference every pulse to the bbox centre, keep +/-W of delay, then low-pass filter
+    across pulses and keep every Da-th. Returns (pulses x M complex64, original pulse index of each output pulse)."""
+    v0, v1, N, M = plan["v0"], plan["v1"], plan["N"], plan["M"]
+    nlo = cphd.n_lo
+    Y = np.zeros((v1 - v0, M), np.complex64)
+    n_idx = (nlo + np.arange(N)).astype(np.float64)
+    with open(cphd.path, "rb") as f, skcphd.Reader(f) as reader:
+        for a in range(v0, v1, chunk):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("cancelled")
+            b = min(v1, a + chunk)
+            sig = cphd.read(reader, a, b)[:, nlo:nlo + N]
+            tc = np.nan_to_num(plan["tau_c"][a - v0:b - v0])
+            freq = cphd.sc0[a:b, None] + n_idx[None, :] * cphd.scss[a:b, None]
+            s = sig * np.exp((-cphd.sgn * 2j * np.pi) * (freq * tc[:, None])).astype(np.complex64)
+            s[~cphd.valid[a:b]] = 0
+            P = sp_fft.ifft(s, axis=1, workers=workers) * N
+            Pc = np.concatenate([P[:, :M // 2], P[:, N - M // 2:]], axis=1)       # keep |delay| <= W
+            Y[a - v0:b - v0] = (sp_fft.fft(Pc, axis=1, workers=workers) / N).astype(np.complex64)
+            if progress:
+                progress(b - v0, v1 - v0)
+    if plan["cut"] < 0.5:
+        from scipy.signal import firwin, upfirdn
+        Da, L = plan["Da"], plan["L"]
+        h = firwin(L, plan["cut"], window=("kaiser", 7.0), fs=1.0)
+        Z = upfirdn(h, Y, up=1, down=Da, axis=0)
+        idx = np.arange(Z.shape[0]) * Da - (L - 1) // 2
+        keep = (idx >= 0) & (idx <= v1 - v0 - 1)                        # filter centred on a real pulse
+        return Z[keep].astype(np.complex64), idx[keep] + v0
+    return Y, np.arange(v0, v1)
+
+
+def write_extract(cphd, plan, Z, centres, out_path):
+    """Write the extract as a CPHD: original header with sizes, swath, timeline and scene reference updated to the bbox,
+    and per-pulse parameters of the kept pulses re-referenced to the bbox centre."""
+    with open(cphd.path, "rb") as f, skcphd.Reader(f) as r:
+        tree = copy.deepcopy(r.metadata.xmltree)
+        pv_all = r.read_pvps(cphd.ch)
+        sa_ids = [s.findtext("{*}Identifier") for s in tree.findall("{*}Data/{*}SupportArray")]
+        support = {sid: r.read_support_array(sid) for sid in sa_ids}
+    root = tree.getroot()
+    data = root.find("{*}Data")
+
+    def drop(node):
+        if node is not None:
+            node.getparent().remove(node)
+
+    def set_text(path, value, base=root):
+        node = base.find(path)
+        if node is not None:
+            node.text = str(value)
+
+    for chan in data.findall("{*}Channel"):                     # keep only the processed channel
+        if chan.findtext("{*}Identifier") != cphd.ch:
+            data.remove(chan)
+    for p in root.findall("{*}Channel/{*}Parameters"):
+        if p.findtext("{*}Identifier") != cphd.ch:
+            drop(p)
+    set_text("{*}Data/{*}SignalArrayFormat", "CF8")
+    set_text("{*}Data/{*}NumCPHDChannels", 1)
+    drop(root.find("{*}Data/{*}SignalCompressionID"))
+    chan = data.find("{*}Channel")
+    for tag, val in (("NumVectors", len(centres)), ("NumSamples", plan["M"]), ("SignalArrayByteOffset", 0),
+                     ("PVPArrayByteOffset", 0)):
+        set_text("{*}" + tag, val, chan)
+    drop(chan.find("{*}CompressedSignalSize"))
+    W, c = plan["W"], plan["c"]
+    set_text("{*}Global/{*}TOASwath/{*}TOAMin", -W)
+    set_text("{*}Global/{*}TOASwath/{*}TOAMax", W)
+    for prm in root.findall("{*}Channel/{*}Parameters"):
+        set_text("{*}TOASaved", 2 * W, prm)
+        drop(prm.find("{*}ImageArea"))
+    tt = cphd.tx_time[centres]
+    set_text("{*}Global/{*}Timeline/{*}TxTime1", float(tt[0]))
+    set_text("{*}Global/{*}Timeline/{*}TxTime2", float(tt[-1]))
+    sc = root.find("{*}SceneCoordinates")
+    for ax, v in zip("XYZ", c):
+        set_text(f"{{*}}IARP/{{*}}ECF/{{*}}{ax}", float(v), sc)
+        set_text(f"{{*}}ReferenceGeometry/{{*}}SRP/{{*}}ECF/{{*}}{ax}", float(v))
+        set_text(f"{{*}}ReferenceGeometry/{{*}}SRP/{{*}}IAC/{{*}}{ax}", 0.0)
+    set_text("{*}IARP/{*}LLH/{*}Lat", plan["lat_c"], sc)
+    set_text("{*}IARP/{*}LLH/{*}Lon", plan["lon_c"], sc)
+    set_text("{*}IARP/{*}LLH/{*}HAE", plan["h_ref"], sc)
+    half = 0.5 * max(plan["bbox_ew_m"], plan["bbox_ns_m"]) * (1 + plan["margin"])
+    for tag, v in (("X1Y1", -half), ("X2Y2", half)):
+        set_text(f"{{*}}ImageArea/{{*}}{tag}/{{*}}X", v, sc)
+        set_text(f"{{*}}ImageArea/{{*}}{tag}/{{*}}Y", v, sc)
+    drop(sc.find("{*}ImageArea/{*}Polygon"))
+    drop(sc.find("{*}ImageGrid"))
+    la0, la1, lo0, lo1 = plan["bbox"]
+    iacp = sc.find("{*}ImageAreaCornerPoints")
+    if iacp is not None:
+        pts = iacp.findall("{*}IACP")
+        for node, (la, lo) in zip(pts, [(la1, lo0), (la1, lo1), (la0, lo1), (la0, lo0)]):
+            set_text("{*}Lat", la, node); set_text("{*}Lon", lo, node)
+
+    pv = pv_all[centres].copy()
+    nlo, N, M = cphd.n_lo, plan["N"], plan["M"]
+    sc0 = cphd.sc0[centres] + nlo * cphd.scss[centres]
+    scss = cphd.scss[centres] * N / M
+    pv["SRPPos"] = c
+    pv["SC0"], pv["SCSS"] = sc0, scss
+    pv["FX1"], pv["FX2"] = np.minimum(sc0, sc0 + (M - 1) * scss), np.maximum(sc0, sc0 + (M - 1) * scss)
+    pv["TOA1"], pv["TOA2"] = -W, W
+    if "SIGNAL" in pv.dtype.names:
+        pv["SIGNAL"] = cphd.valid[centres].astype(pv["SIGNAL"].dtype)
+    if "AmpSF" in pv.dtype.names:
+        pv["AmpSF"] = 1.0
+    with open(out_path, "wb") as fh, skcphd.Writer(fh, skcphd.Metadata(xmltree=tree)) as w:
+        w.write_signal(cphd.ch, Z.astype(np.complex64))
+        w.write_pvp(cphd.ch, pv)
+        for sid, arr in support.items():
+            w.write_support_array(sid, arr)
+    return out_path
+
+
+def dims_of(c):
+    """Size and sampling of a CPHD, for the side-by-side table."""
+    m = c.m_ref
+    scss = abs(c.scss[m])
+    return dict(pulses=int(len(c.good)), pulses_total=int(c.nv), samples=int(c.n_hi - c.n_lo), samples_total=int(c.ns),
+                prf=c.prf, duration_s=c.t_end, scss_hz=scss, bandwidth_mhz=c.bandwidth / 1e6, delay_us=1e6 / scss,
+                slant_m=C / (2 * scss), fmt=c.fmt, file_mb=os.path.getsize(c.path) / 1e6,
+                ref=f"{c.lat0:.6f}, {c.lon0:.6f}")
+
+
 # ------------------------------------------------------------------ engine: blocks, cache, jobs
 class Engine:
     def __init__(self, cache_dir, workers, max_side=1500, cache_gb=30.0):
@@ -241,6 +444,10 @@ class Engine:
         self.version = 0
         self.rate = 0.6e7 * self.workers                 # pixel-pulses per second; replaced by a measurement after a run
         self.cancel = threading.Event()
+        self.xjob = dict(state="idle", done=0, total=0, t0=0.0, message="", error="")
+        self.xresult = None
+        self.xcancel = threading.Event()
+        self.out_dir = os.path.join(cache_dir, "extracts")
 
     def start_pool(self):
         if self.pool is None:
@@ -261,6 +468,9 @@ class Engine:
             self.t_edges = np.append(cphd.t[self.edges[:-1]], cphd.t_end)
             self.step = float(cphd.t_end / self.n_blocks)
             self.gkey, self.grid, self.blocks, self.counts, self.result = None, None, {}, {}, None
+            if self.xjob["state"] != "running":
+                self.xresult = None
+                self.xjob = dict(state="idle", done=0, total=0, t0=0.0, message="", error="")
         return self.meta()
 
     def meta(self):
@@ -268,13 +478,15 @@ class Engine:
         if c is None:
             return None
         f = c.full
-        return dict(path=c.path, name=os.path.basename(c.path), size_gb=os.path.getsize(c.path) / 1e9, n_pulses=c.nv,
+        return dict(path=c.path, name=os.path.basename(c.path), size_gb=os.path.getsize(c.path) / 1e9 if os.path.exists(c.path) else float('nan'), n_pulses=c.nv,
                     n_usable=int(len(c.good)), n_flagged=c.n_flagged, n_nonfinite=c.n_nonfinite, n_samples=c.ns, fmt=c.fmt,
                     prf=c.prf, duration_s=c.t_end, fc_ghz=c.fc / 1e9, bandwidth_mhz=c.bandwidth / 1e6, lat0=c.lat0, lon0=c.lon0,
                     h0=c.h0, start_utc=str(c.t0), scene_size_m=c.scene_size_m, scene_size_from=c.scene_size_from,
                     graze_deg=f["graze_deg"], look_azimuth_deg=f["look_azimuth_deg"], look_side=f["look_side"],
                     slant_range_km=f["slant_range_km"], cross_range_res_m=f["cross_range_res_m"],
-                    ground_range_res_m=f["ground_range_res_m"], n_blocks=self.n_blocks, t_edges=[float(t) for t in self.t_edges])
+                    ground_range_res_m=f["ground_range_res_m"], n_blocks=self.n_blocks, t_edges=[float(t) for t in self.t_edges],
+                    aoi_corners=c.aoi_corners, aoi_bbox=c.aoi_bbox, aoi_from=c.aoi_from,
+                    aoi_ew_m=bbox_size_m(c.aoi_bbox)[0], aoi_ns_m=bbox_size_m(c.aoi_bbox)[1])
 
     # ---- planning
     def plan(self, p):
@@ -446,6 +658,121 @@ class Engine:
         j["ready"] = sorted(int(k) for k in self._available(self.gkey)) if self.gkey else []
         return j
 
+    # ---- chip extraction
+    def xplan(self, p):
+        """Chip box and the planned size of its extract. Geometry only."""
+        c = self.cphd
+        if c is None:
+            raise ValueError("load a CPHD first")
+        n = int(p.get("chip_px") or 512)
+        pixel = float(p.get("chip_pixel_m") or 0.5)
+        if not (16 <= n <= 8192) or not (0.01 <= pixel <= 100):
+            raise ValueError("chip size or pixel out of range")
+        lat = c.lat0 if p.get("chip_lat") in (None, "") else float(p["chip_lat"])
+        lon = c.lon0 if p.get("chip_lon") in (None, "") else float(p["chip_lon"])
+        h_ref = c.h0 if p.get("h_ref") in (None, "") else float(p["h_ref"])
+        margin = float(p.get("margin", 0.25) if p.get("margin") not in (None, "") else 0.25)
+        w, s_, e, n_ = GeoGrid(lat, lon, n * pixel, pixel, h_ref).bounds
+        bbox = (s_, n_, w, e)
+        plan = plan_extraction(c, bbox, h_ref, margin=margin, guard=0.25)
+        full = dims_of(c)
+        scss_x = full["scss_hz"] * plan["N"] / plan["M"]
+        est = dict(pulses=plan["n_keep"], pulses_total=plan["n_keep"], samples=plan["M"], samples_total=plan["M"],
+                   prf=c.prf / plan["Da"], duration_s=c.t_end, scss_hz=scss_x, bandwidth_mhz=full["bandwidth_mhz"],
+                   delay_us=1e6 / scss_x, slant_m=C / (2 * scss_x), fmt="CF8", file_mb=plan["n_keep"] * plan["M"] * 8 / 1e6,
+                   ref=f"{plan['lat_c']:.6f}, {plan['lon_c']:.6f}")
+        a = c.aoi_bbox
+        inside = a[0] <= bbox[0] and bbox[1] <= a[1] and a[2] <= bbox[2] and bbox[3] <= a[3]
+        warn = []
+        if not inside:
+            warn.append("the chip reaches outside the AOI of this CPHD")
+        if plan["exceeds_swath"]:
+            warn.append("part of the chip is outside the delay span the CPHD holds; that part cannot be recovered")
+        band_mb = len(c.good) * full["samples"] * 8 / 1e6
+        public = dict(chip_px=n, chip_pixel_m=pixel, size_m=n * pixel, center_lat=lat, center_lon=lon, h_ref=h_ref,
+                      bbox=list(bbox), bbox_margin=list(self._grow(bbox, margin)), margin=margin, inside_aoi=inside,
+                      warnings=warn, Da=plan["Da"], L=plan["L"], W_us=plan["W"] * 1e6,
+                      doppler_hz=2 * plan["B_d"] * c.prf, reduction=band_mb / max(est["file_mb"], 1e-9),
+                      rows=self._rows(full, est, c, bbox, planned=True))
+        return plan, public
+
+    @staticmethod
+    def _grow(b, m):
+        dla, dlo = (b[1] - b[0]) * m / 2, (b[3] - b[2]) * m / 2
+        return (b[0] - dla, b[1] + dla, b[2] - dlo, b[3] + dlo)
+
+    @staticmethod
+    def _rows(full, ext, c, bbox, planned):
+        aew, ans = bbox_size_m(c.aoi_bbox)
+        ew, ns_ = bbox_size_m(bbox)
+        fmtn = lambda d: f"{d['pulses']:,} x {d['samples']:,}"
+        def size(mb):
+            return f"{mb / 1e3:.2f} GB" if mb >= 1e3 else f"{mb:.1f} MB"
+        tag = "~" if planned else ""
+        return [
+            ["ground area", f"{aew:.0f} x {ans:.0f} m (AOI)", f"{ew:.0f} x {ns_:.0f} m"],
+            ["pulses x samples", fmtn(full), tag + fmtn(ext)],
+            ["pulses, slow time", f"{full['pulses']:,} of {full['pulses_total']:,}", f"{ext['pulses']:,}"],
+            ["samples / pulse, fast time", f"{full['samples']:,} of {full['samples_total']:,}", f"{ext['samples']:,}"],
+            ["pulse rate", f"{full['prf']:,.1f} Hz", f"{ext['prf']:,.1f} Hz"],
+            ["collect time", f"{full['duration_s']:.3f} s", tag + f"{ext['duration_s']:.3f} s"],
+            ["sample spacing", f"{full['scss_hz'] / 1e3:,.2f} kHz", f"{ext['scss_hz'] / 1e3:,.2f} kHz"],
+            ["bandwidth", f"{full['bandwidth_mhz']:.1f} MHz", f"{ext['bandwidth_mhz']:.1f} MHz"],
+            ["delay span held", f"{full['delay_us']:.3f} µs", f"{ext['delay_us']:.3f} µs"],
+            ["slant range held", f"{full['slant_m']:,.0f} m", f"{ext['slant_m']:,.0f} m"],
+            ["signal format", full["fmt"], ext["fmt"]],
+            ["size", size(full["file_mb"]), tag + size(ext["file_mb"])],
+            ["reference point", full["ref"], ext["ref"]],
+        ]
+
+    def xrun(self, p):
+        with self.lock:
+            if self.xjob["state"] == "running":
+                raise RuntimeError("an extraction is already running")
+            plan, public = self.xplan(p)
+            self.xjob = dict(state="running", done=0, total=plan["v1"] - plan["v0"], t0=time.time(),
+                             message="reading pulses", error="")
+            self.xcancel.clear()
+        threading.Thread(target=self._xrun, args=(self.cphd, plan, public), daemon=True).start()
+        return public
+
+    def _xrun(self, c, plan, public):
+        try:
+            t0 = time.time()
+            def prog(done, total):
+                self.xjob.update(done=done, total=total, message=f"reading and re-referencing pulses")
+            Z, centres = extract_bbox(c, plan, workers=self.workers, progress=prog, cancel=self.xcancel)
+            self.xjob["message"] = "writing CPHD"
+            os.makedirs(self.out_dir, exist_ok=True)
+            stem = os.path.splitext(os.path.basename(c.path))[0]
+            stem = re.sub(r"_chip\d+_[-0-9.]+_[-0-9.]+$", "", stem)
+            name = f"{stem}_chip{public['chip_px']}_{plan['lat_c']:.5f}_{plan['lon_c']:.5f}"
+            out = os.path.join(self.out_dir, name + ".cphd")
+            write_extract(c, plan, Z, centres, out)
+            ext = CPHD(out)                                             # read back what was written
+            full, got = dims_of(c), dims_of(ext)
+            rows = self._rows(full, got, c, plan["bbox"], planned=False)
+            res = dict(public, rows=rows, path=out, name=os.path.basename(out), seconds=time.time() - t0,
+                       pulse_first=int(centres[0]), pulse_last=int(centres[-1]), pulse_step=int(plan["Da"]),
+                       shape=[int(Z.shape[0]), int(Z.shape[1])], source=c.path)
+            with open(out[:-5] + ".json", "w") as fh:
+                json.dump(dict(res, original_pulse_index=[int(x) for x in centres]), fh, indent=1, default=str)
+            self.xresult = res
+            self.xjob.update(state="done", message="done")
+        except InterruptedError:
+            self.xjob.update(state="cancelled", message="cancelled")
+        except Exception as e:
+            traceback.print_exc()
+            self.xjob.update(state="error", error=f"{type(e).__name__}: {e}", message="failed")
+
+    def xstatus(self):
+        j = dict(self.xjob)
+        el = time.time() - j["t0"] if j["state"] == "running" else 0.0
+        j["elapsed"] = el
+        j["eta"] = (el / j["done"] * (j["total"] - j["done"])) if j["state"] == "running" and j["done"] else None
+        j["result"] = self.xresult
+        return j
+
     # ---- outputs
     def png(self, lo, hi):
         from PIL import Image
@@ -601,6 +928,39 @@ def selftest(cache_dir, workers):
             good = str(src.crs) == "EPSG:4326" and src.dtypes[0] == "complex64" and png[:4] == b"\x89PNG"
         ok &= good
         print(f"PNG and EPSG:4326 complex GeoTIFF written | {'ok' if good else 'FAIL'}")
+
+        # chip extraction: 256 px at 0.5 m around target 1; target 0 is 180 m away, outside the chip and its margin
+        t1, t0 = truth[1], truth[0]
+        xp = dict(chip_px=256, chip_pixel_m=0.5, chip_lat=t1["lat"], chip_lon=t1["lon"])
+        pub = eng.xrun(xp)
+        while eng.xstatus()["state"] == "running":
+            time.sleep(0.2)
+        xs = eng.xstatus()
+        if xs["state"] != "done":
+            raise RuntimeError(xs["error"] or xs["state"])
+        r = xs["result"]
+        ext = CPHD(r["path"])
+        good = ext.nv == r["shape"][0] and ext.ns == r["shape"][1] < eng.cphd.ns and len(pub["rows"]) == len(r["rows"])
+        ok &= good
+        print(f"extract written: {eng.cphd.nv} x {eng.cphd.ns} -> {ext.nv} x {ext.ns}, "
+              f"{os.path.getsize(r['path']) / 1e6:.1f} MB, JSON {'present' if os.path.exists(r['path'][:-5] + '.json') else 'MISSING'} "
+              f"| {'ok' if good else 'FAIL'}")
+        g = GeoGrid(t1["lat"], t1["lon"], 128, 0.5, eng.cphd.h0)
+        a = backproject(eng.cphd, int(eng.cphd.good[0]), int(eng.cphd.good[-1]) + 1, g.ecef(), 1.0)[0]
+        b = backproject(ext, int(ext.good[0]), int(ext.good[-1]) + 1, g.ecef(), 1.0)[0]
+        cc = float(np.abs(np.vdot(a, b)) / (np.linalg.norm(a) * np.linalg.norm(b)))
+        rr, cc_ = [float(v) for v in g.ll_to_rc(t1["lat"], t1["lon"])]
+        amp = np.abs(b).reshape(g.n, g.n)
+        pr, pc = np.unravel_index(np.argmax(amp), amp.shape)
+        off = math.hypot(pr - rr, pc - cc_)
+        g0 = GeoGrid(t0["lat"], t0["lon"], 8, 0.5, eng.cphd.h0)
+        a0 = backproject(eng.cphd, int(eng.cphd.good[0]), int(eng.cphd.good[-1]) + 1, g0.ecef(), 1.0)
+        b0 = backproject(ext, int(ext.good[0]), int(ext.good[-1]) + 1, g0.ecef(), 1.0)
+        sup = 20 * math.log10((np.abs(b0[0]).max() / max(b0[1], 1) + 1e-30) / (np.abs(a0[0]).max() / a0[1]))
+        good = cc > 0.98 and off <= 1.0 and sup < -25
+        ok &= good
+        print(f"extract vs full on the chip: correlation {cc:.4f}, target offset {off:.2f} px; target outside the chip "
+              f"{f'{sup:.1f} dB' if sup > -200 else 'removed'} | {'ok' if good else 'FAIL'}")
     finally:
         eng.stop_pool()
     print("SELF-TEST", "PASSED" if ok else "FAILED")
@@ -663,6 +1023,21 @@ main{display:grid;grid-template-rows:auto 1fr auto;min-width:0;min-height:0}
 #blocks div.win.ready{background:#8a8f63}
 #blocks div.drag{outline:1px solid var(--amber)}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
+#ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible}
+#xdims{position:absolute;right:12px;top:12px;width:440px;max-width:calc(100% - 24px);background:rgba(13,15,11,.92);border:1px solid var(--line);padding:10px 12px;cursor:default}
+#xdims .cap{display:flex;justify-content:space-between;align-items:center;font:600 13px/1 var(--cond);letter-spacing:.2em;text-transform:uppercase;color:var(--amber)}
+#xdims .cap span{cursor:pointer;color:var(--dim);letter-spacing:0;font:12px var(--mono)}
+#xdims.min table{display:none}
+table.dims{width:100%;border-collapse:collapse;margin-top:8px;font-size:11.5px}
+table.dims th{font:600 11px/1.2 var(--cond);letter-spacing:.12em;text-transform:uppercase;color:var(--amber);text-align:right;padding:3px 0 5px 6px;border-bottom:1px solid var(--line)}
+table.dims th:first-child{text-align:left;padding-left:0}
+table.dims td{padding:2px 0 2px 6px;text-align:right;border-bottom:1px solid #23271e;vertical-align:top}
+table.dims td:first-child{color:var(--dim);text-align:left;padding-left:0}
+table.dims tr.key td{color:var(--ink);font-weight:600}table.dims tr.key td:last-child{color:var(--amber)}
+.xbar{height:3px;background:#22261c;margin-top:8px}.xbar div{height:100%;width:0;background:var(--amber)}
+.links a{color:var(--amber);text-decoration:none;border-bottom:1px dotted var(--amber2);margin-right:12px}
+input[type=file]{width:100%;color:var(--dim);font:inherit;margin-top:8px}
+.chk{display:flex;gap:6px;align-items:center;margin-top:8px;color:var(--dim)}.chk input{margin:0}
 </style></head><body>
 <aside>
   <h1>CPHD <b>/</b> ground</h1>
@@ -672,6 +1047,10 @@ main{display:grid;grid-template-rows:auto 1fr auto;min-width:0;min-height:0}
   <select id="file"></select>
   <input type="text" id="path" placeholder="or type a path on the server" style="margin-top:6px">
   <button id="load" style="margin-top:8px;width:100%">Load</button>
+  <input type="file" id="up" accept=".cphd">
+  <button id="upbtn" style="margin-top:6px;width:100%">Upload and load</button>
+  <div class="xbar" id="upbar" hidden><div></div></div><div class="hint" id="upmsg">Large files: copying to the server and picking it above is faster than uploading over the tunnel.</div>
+  <label class="chk"><input type="checkbox" id="ql" checked>Quick look of the whole AOI after loading</label>
   <dl id="meta" style="margin-top:12px"></dl>
 
   <h2><i>02</i> Area</h2>
@@ -695,13 +1074,28 @@ main{display:grid;grid-template-rows:auto 1fr auto;min-width:0;min-height:0}
   <div class="plan" id="plan">Load a CPHD to begin.</div>
   <button class="go" id="go" disabled>Reconstruct</button>
   <button id="cancel" style="width:100%;margin-top:8px" disabled>Cancel</button>
+
+  <h2><i>04</i> Extract CPHD chip</h2>
+  <div class="seg"><label><input type="radio" name="chip" value="256"><span>256 x 256</span></label>
+    <label><input type="radio" name="chip" value="512" checked><span>512 x 512</span></label></div>
+  <div class="row"><div><label>Chip pixel, metres</label><input type="number" id="cpix" value="0.5" min="0.05" step="0.05"></div>
+    <div><label>Margin, fraction</label><input type="number" id="cmargin" value="0.25" min="0" max="2" step="0.05"></div></div>
+  <div class="row"><div><label>Chip centre latitude</label><input type="number" id="xlat" step="0.000001"></div>
+    <div><label>Chip centre longitude</label><input type="number" id="xlon" step="0.000001"></div></div>
+  <div class="hint">Click the image to centre the chip there. Plane height is shared with 02.</div>
+  <div class="plan" id="xplan">Load a CPHD to begin.</div>
+  <div class="xbar" id="xbar"><div></div></div>
+  <button class="go" id="xgo" disabled>Extract CPHD</button>
+  <button id="xcancel" style="width:100%;margin-top:8px" disabled>Cancel extraction</button>
+  <div class="links" id="xlinks" style="margin-top:10px" hidden><a href="/api/xfile?kind=cphd">extract .cphd</a><a href="/api/xfile?kind=json">dimensions .json</a>
+    <button id="xopen" style="margin-top:8px;width:100%">Open extract in the viewer</button></div>
 </aside>
 <main>
   <div class="bar"><span class="grow" id="info">No image yet.</span>
     <span>dB <input type="number" id="lo" value="-5" step="1"> to <input type="number" id="hi" value="30" step="1"></span>
     <button id="fit">Fit</button>
     <a id="dlc" href="#" hidden>GeoTIFF complex</a><a id="dla" href="#" hidden>GeoTIFF 8-bit</a></div>
-  <div id="stage"><div id="prog"><div></div></div><img id="img" alt="" hidden draggable="false">
+  <div id="stage"><div id="prog"><div></div></div><img id="img" alt="" hidden draggable="false"><svg id="ov"></svg><div id="xdims" hidden></div>
     <div id="empty">Choose an area and a time window,<br>then reconstruct</div><div id="read" hidden></div></div>
   <div id="tl"><div class="cap"><span id="tlcap">Slow time</span><span>pale = projected and kept &middot; amber = current window</span></div><div id="blocks"></div></div>
 </main>
@@ -713,9 +1107,10 @@ const f=(v,d=2)=>v==null||!isFinite(v)?'n/a':Number(v).toFixed(d);
 const dur=s=>s==null?'':s<90?Math.round(s)+' s':(s/60).toFixed(1)+' min';
 function params(){return{mode:q('input[name=mode]:checked').value,size_m:$('size').value,center_lat:$('clat').value,center_lon:$('clon').value,pixel_m:$('pixel').value,h_ref:$('href').value,time:q('input[name=time]:checked').value,t1:$('t1').value,t2:$('t2').value}}
 function showMeta(){const m=meta;if(!m){$('meta').innerHTML='';return}
-  const rows=[['pulses',m.n_usable+' of '+m.n_pulses+' usable'],['collect',f(m.duration_s)+' s at '+f(m.prf,0)+' Hz'],['samples',m.n_samples+' '+m.fmt],['bandwidth',f(m.bandwidth_mhz,0)+' MHz at '+f(m.fc_ghz,3)+' GHz'],['scene centre',f(m.lat0,5)+', '+f(m.lon0,5)],['scene size',f(m.scene_size_m,0)+' m ('+m.scene_size_from+')'],['geometry',f(m.graze_deg,1)+'° grazing, '+m.look_side+'-looking'],['full resolution',f(m.cross_range_res_m)+' x '+f(m.ground_range_res_m)+' m']];
+  const rows=[['pulses',m.n_usable+' of '+m.n_pulses+' usable'],['collect',f(m.duration_s)+' s at '+f(m.prf,0)+' Hz'],['samples',m.n_samples+' '+m.fmt],['bandwidth',f(m.bandwidth_mhz,0)+' MHz at '+f(m.fc_ghz,3)+' GHz'],['scene centre',f(m.lat0,5)+', '+f(m.lon0,5)],['scene size',f(m.scene_size_m,0)+' m ('+m.scene_size_from+')'],['geometry',f(m.graze_deg,1)+'° grazing, '+m.look_side+'-looking'],['full resolution',f(m.cross_range_res_m)+' x '+f(m.ground_range_res_m)+' m'],['AOI lat',f(m.aoi_bbox[0],5)+' to '+f(m.aoi_bbox[1],5)],['AOI lon',f(m.aoi_bbox[2],5)+' to '+f(m.aoi_bbox[3],5)],['AOI size',f(m.aoi_ew_m,0)+' x '+f(m.aoi_ns_m,0)+' m ('+m.aoi_from+')']];
   $('meta').innerHTML=rows.map(r=>'<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>').join('');
   if(!$('clat').value){$('clat').value=m.lat0.toFixed(6);$('clon').value=m.lon0.toFixed(6)}
+  if(!$('xlat').value){$('xlat').value=((m.aoi_bbox[0]+m.aoi_bbox[1])/2).toFixed(6);$('xlon').value=((m.aoi_bbox[2]+m.aoi_bbox[3])/2).toFixed(6)}
   if(!$('t1').value){$('t1').value=(m.duration_s*0.4).toFixed(2);$('t2').value=(m.duration_s*0.6).toFixed(2)}
   $('t1').max=$('t2').max=m.duration_s.toFixed(2);drawBlocks([])}
 function enable(){const sub=q('input[name=mode]:checked').value==='sub',cus=q('input[name=time]:checked').value==='custom';
@@ -733,11 +1128,11 @@ $('blocks').addEventListener('mousemove',e=>{if(!drag)return;const k=e.target.da
 window.addEventListener('mouseup',()=>{if(!drag)return;const a=Math.min(...drag),b=Math.max(...drag)+1;drag=null;
   q('input[name=time][value=custom]').checked=true;$('t1').value=meta.t_edges[a].toFixed(2);$('t2').value=meta.t_edges[b].toFixed(2);replan()});
 function mark(){const a=Math.min(...drag),b=Math.max(...drag);[...$('blocks').children].forEach((d,i)=>d.classList.toggle('drag',i>=a&&i<=b))}
-function apply(){$('img').style.transform='translate('+view.x+'px,'+view.y+'px) scale('+view.s+')'}
+function apply(){$('img').style.transform='translate('+view.x+'px,'+view.y+'px) scale('+view.s+')';drawOv()}
 function fit(){if(!result)return;const st=$('stage').getBoundingClientRect(),s=Math.min(st.width,st.height)/result.n*0.96;view={s,x:(st.width-result.n*s)/2,y:(st.height-result.n*s)/2};apply()}
 function loadImg(){if(!result)return;$('img').src='/api/image.png?lo='+$('lo').value+'&hi='+$('hi').value+'&v='+result.version;
   $('dlc').href='/api/geotiff?kind=complex';$('dla').href='/api/geotiff?kind=amplitude&lo='+$('lo').value+'&hi='+$('hi').value;$('dlc').hidden=$('dla').hidden=false}
-function showResult(r,refit){const first=!result||refit;result=r;$('img').hidden=false;$('empty').hidden=true;loadImg();if(first)fit();
+function showResult(r,refit){const first=!result||refit;result=r;$('img').hidden=false;$('empty').hidden=true;loadImg();if(first)fit();drawOv();
   $('info').textContent='t '+f(r.t1)+' to '+f(r.t2)+' s | pulses '+r.pulse_first+'..'+r.pulse_last+' | '+r.n+' px at '+f(r.pixel_m)+' m | cross-range '+f(r.cross_range_res_m)+' m, range '+f(r.range_res_m)+' m | '+(r.computed_blocks?r.computed_blocks+' blocks in '+dur(r.seconds):'from finished blocks')}
 async function poll(){try{const s=await api('/api/status');const bar=q('#prog div');
   if(s.state==='running'){bar.style.width=(s.total?100*s.done/s.total:100)+'%';$('plan').className='plan';$('plan').innerHTML=s.message+'<br>'+s.done+' of '+s.total+' pulses, '+dur(s.elapsed)+' elapsed'+(s.eta!=null?', about '+dur(s.eta)+' left':'');drawBlocks(s.ready,plan&&plan.k1,plan&&plan.k2)}
@@ -746,28 +1141,76 @@ async function poll(){try{const s=await api('/api/status');const bar=q('#prog di
     if(s.state==='error'){$('plan').className='plan err';$('plan').textContent=s.error}else replan()}}catch(e){}}
 $('go').onclick=async()=>{try{$('go').disabled=true;$('cancel').disabled=false;plan=await api('/api/run',params());if(!polling)polling=setInterval(poll,500);poll()}catch(e){$('plan').className='plan err';$('plan').textContent=e.message;$('go').disabled=false;$('cancel').disabled=true}};
 $('cancel').onclick=()=>api('/api/cancel',{});
-$('load').onclick=async()=>{const p=$('path').value.trim()||$('file').value;if(!p)return;$('load').disabled=true;$('load').textContent='Loading';
-  try{meta=await api('/api/load',{path:p});result=null;$('img').hidden=true;$('empty').hidden=false;$('read').hidden=$('dlc').hidden=$('dla').hidden=true;$('info').textContent='No image yet.';$('clat').value=$('clon').value=$('t1').value=$('t2').value='';showMeta();replan()}
-  catch(e){$('plan').className='plan err';$('plan').textContent=e.message}$('load').disabled=false;$('load').textContent='Load'};
+async function loadPath(p){if(!p)return;$('load').disabled=true;$('load').textContent='Loading';
+  try{meta=await api('/api/load',{path:p});result=null;xres=null;$('img').hidden=true;$('empty').hidden=false;$('read').hidden=$('dlc').hidden=$('dla').hidden=true;$('info').textContent='No image yet.';
+    $('clat').value=$('clon').value=$('t1').value=$('t2').value=$('xlat').value=$('xlon').value='';$('xdims').innerHTML='';$('xdims').hidden=true;$('xlinks').hidden=true;showMeta();await refreshFiles();$('file').value=meta.path;replan();xreplan();
+    if($('ql').checked)quickLook()}
+  catch(e){$('plan').className='plan err';$('plan').textContent=e.message}$('load').disabled=false;$('load').textContent='Load'}
+$('load').onclick=()=>loadPath($('path').value.trim()||$('file').value);
+async function quickLook(){const px=Math.max(0.1,Math.ceil(meta.scene_size_m/600*10)/10);
+  try{$('go').disabled=true;$('cancel').disabled=false;plan=await api('/api/run',Object.assign(params(),{mode:'full',pixel_m:px,time:'auto'}));$('plan').className='plan';$('plan').textContent='quick look of the AOI at '+px+' m';
+    if(!polling)polling=setInterval(poll,500);poll()}catch(e){$('go').disabled=false;$('cancel').disabled=true}}
+async function refreshFiles(){const s=await api('/api/state');$('file').innerHTML=s.files.length?s.files.map(p=>'<option value="'+p+'">'+(p.startsWith(s.data_dir+'/')?p.replace(s.data_dir+'/',''):p)+'</option>').join(''):'<option value="">no .cphd files under '+s.data_dir+'</option>';return s}
+$('upbtn').onclick=()=>{const fl=$('up').files[0];if(!fl)return;const x=new XMLHttpRequest(),bar=q('#upbar div');$('upbar').hidden=false;$('upbtn').disabled=true;
+  x.open('PUT','/api/upload?name='+encodeURIComponent(fl.name));
+  x.upload.onprogress=e=>{if(e.lengthComputable){bar.style.width=(100*e.loaded/e.total)+'%';$('upmsg').textContent='uploading '+(e.loaded/1e9).toFixed(2)+' of '+(e.total/1e9).toFixed(2)+' GB'}};
+  x.onload=()=>{$('upbtn').disabled=false;$('upbar').hidden=true;let j={};try{j=JSON.parse(x.responseText)}catch(e){}
+    if(x.status!==200){$('upmsg').textContent='upload failed: '+(j.error||x.status);return}$('upmsg').textContent='uploaded to '+j.path;loadPath(j.path)};
+  x.onerror=()=>{$('upbtn').disabled=false;$('upmsg').textContent='upload failed (connection)'};x.send(fl)};
+// ---- chip extraction
+let xp=null,xres=null,xtimer=null,xpolling=null;
+function xparams(){return{chip_px:q('input[name=chip]:checked').value,chip_pixel_m:$('cpix').value,chip_lat:$('xlat').value,chip_lon:$('xlon').value,h_ref:$('href').value,margin:$('cmargin').value}}
+function dimsTable(rows,head){$('xdims').hidden=false;return '<div class="cap">CPHD dimensions<span onclick="this.closest(\'#xdims\').classList.toggle(\'min\')">hide / show</span></div><table class="dims"><tr><th></th><th>full CPHD</th><th>'+head+'</th></tr>'+rows.map((r,i)=>'<tr'+(i===1?' class="key"':'')+'><td>'+r[0]+'</td><td>'+r[1]+'</td><td>'+r[2]+'</td></tr>').join('')+'</table>'}
+async function xreplan(){if(!meta)return;try{xp=await api('/api/xplan',xparams());const p=xp,b=p.bbox;
+  $('xplan').className='plan'+(p.warnings.length?' err':'');
+  $('xplan').innerHTML=p.chip_px+' x '+p.chip_px+' px at '+f(p.chip_pixel_m)+' m = '+f(p.size_m,0)+' m square<br>lat '+f(b[0],6)+' to '+f(b[1],6)+'<br>lon '+f(b[2],6)+' to '+f(b[3],6)+
+    '<br>keeps &plusmn;'+f(p.W_us,3)+' &micro;s of delay, '+f(p.doppler_hz,0)+' Hz of Doppler; keeps 1 of every '+p.Da+' pulses; about '+f(p.reduction,0)+'x smaller'+(p.warnings.length?'<br>'+p.warnings.join('<br>'):'');
+  if(!xres||xres._stale)$('xdims').innerHTML=dimsTable(p.rows,'chip, planned');$('xgo').disabled=xpolling!=null;drawOv()}
+  catch(e){$('xplan').className='plan err';$('xplan').textContent=e.message;$('xgo').disabled=true}}
+const xsoon=()=>{clearTimeout(xtimer);if(xres)xres._stale=true;xtimer=setTimeout(xreplan,250)};
+['cpix','cmargin','xlat','xlon','href'].forEach(id=>$(id).addEventListener('input',xsoon));
+document.querySelectorAll('input[name=chip]').forEach(e=>e.addEventListener('change',xsoon));
+$('xgo').onclick=async()=>{try{$('xgo').disabled=true;$('xcancel').disabled=false;$('xlinks').hidden=true;xres=null;await api('/api/xrun',xparams());if(!xpolling)xpolling=setInterval(xpoll,500);xpoll()}
+  catch(e){$('xplan').className='plan err';$('xplan').textContent=e.message;$('xgo').disabled=false;$('xcancel').disabled=true}};
+$('xcancel').onclick=()=>api('/api/xcancel',{});
+$('xopen').onclick=()=>{if(xres)loadPath(xres.path)};
+async function xpoll(){try{const s=await api('/api/xstatus'),bar=q('#xbar div');
+  if(s.state==='running'){bar.style.width=(s.total?100*s.done/s.total:100)+'%';$('xplan').className='plan';$('xplan').innerHTML=s.message+'<br>'+s.done+' of '+s.total+' pulses, '+dur(s.elapsed)+' elapsed'+(s.eta!=null?', about '+dur(s.eta)+' left':'')}
+  else{clearInterval(xpolling);xpolling=null;bar.style.width='0';$('xgo').disabled=false;$('xcancel').disabled=true;
+    if(s.state==='done'&&s.result)showX(s.result);else if(s.state==='error'){$('xplan').className='plan err';$('xplan').textContent=s.error}else xreplan()}}catch(e){}}
+function showX(r){xres=r;$('xplan').className='plan';$('xplan').innerHTML='<span class="ok">written</span> '+r.name+'<br>signal '+r.shape[0]+' pulses x '+r.shape[1]+' samples, from original pulses '+r.pulse_first+'..'+r.pulse_last+' every '+r.pulse_step+'<br>done in '+dur(r.seconds);
+  $('xdims').innerHTML=dimsTable(r.rows,'chip, written');$('xlinks').hidden=false;drawOv()}
+function toXY(lat,lon){const b=result.bounds,u=(lon-b[0])/(b[2]-b[0]),v=(b[3]-lat)/(b[3]-b[1]);return[view.x+u*result.n*view.s,view.y+v*result.n*view.s]}
+function rect(b,attrs){const p=[[b[1],b[2]],[b[1],b[3]],[b[0],b[3]],[b[0],b[2]]].map(c=>toXY(c[0],c[1]).join(',')).join(' ');return '<polygon points="'+p+'" '+attrs+'/>'}
+function drawOv(){const o=$('ov');if(!result||!meta){o.innerHTML='';return}let h='';
+  h+='<polygon points="'+meta.aoi_corners.map(c=>toXY(c[0],c[1]).join(',')).join(' ')+'" fill="none" stroke="#9b9684" stroke-width="1.2" stroke-dasharray="6 4"/>';
+  if(xres&&!xres._stale)h+=rect(xres.bbox,'fill="rgba(159,196,106,.10)" stroke="#9fc46a" stroke-width="1.6"');
+  if(xp){h+=rect(xp.bbox_margin,'fill="none" stroke="#f2b134" stroke-opacity=".7" stroke-width="1" stroke-dasharray="3 3"');h+=rect(xp.bbox,'fill="rgba(242,177,52,.08)" stroke="#f2b134" stroke-width="1.6"');
+    const c=toXY(xp.center_lat,xp.center_lon);h+='<path d="M'+(c[0]-6)+' '+c[1]+'h12M'+c[0]+' '+(c[1]-6)+'v12" stroke="#f2b134" stroke-width="1.2"/>'}
+  o.innerHTML=h}
 document.querySelectorAll('aside input').forEach(e=>{if(e.id!=='path')e.addEventListener('input',soon)});
 $('lo').onchange=$('hi').onchange=loadImg;$('fit').onclick=fit;
 const stage=$('stage');let pan=null;
 function ll(e){const b=result.bounds,r=stage.getBoundingClientRect(),u=(e.clientX-r.left-view.x)/view.s/result.n,v=(e.clientY-r.top-view.y)/view.s/result.n;return[b[3]-v*(b[3]-b[1]),b[0]+u*(b[2]-b[0]),u>=0&&u<=1&&v>=0&&v<=1]}
-stage.addEventListener('wheel',e=>{if(!result)return;e.preventDefault();const r=stage.getBoundingClientRect(),k=e.deltaY<0?1.25:0.8,mx=e.clientX-r.left,my=e.clientY-r.top;
+stage.addEventListener('wheel',e=>{if(!result||e.target.closest('#xdims'))return;e.preventDefault();const r=stage.getBoundingClientRect(),k=e.deltaY<0?1.25:0.8,mx=e.clientX-r.left,my=e.clientY-r.top;
   view.x=mx-(mx-view.x)*k;view.y=my-(my-view.y)*k;view.s*=k;apply()},{passive:false});
-stage.addEventListener('mousedown',e=>{if(result)pan=[e.clientX-view.x,e.clientY-view.y]});
+let down=null;
+stage.addEventListener('mousedown',e=>{if(e.target.closest('#xdims')){down=null;return}if(result){pan=[e.clientX-view.x,e.clientY-view.y];down=[e.clientX,e.clientY]}});
+stage.addEventListener('click',e=>{if(e.target.closest('#xdims')||!result||!down||Math.hypot(e.clientX-down[0],e.clientY-down[1])>4)return;const p=ll(e);if(!p[2])return;
+  $('xlat').value=p[0].toFixed(6);$('xlon').value=p[1].toFixed(6);if(xres)xres._stale=true;xreplan()});
 window.addEventListener('mousemove',e=>{if(pan){view.x=e.clientX-pan[0];view.y=e.clientY-pan[1];apply()}
   if(result&&stage.contains(e.target)){const p=ll(e);$('read').hidden=!p[2];$('read').textContent='lat '+p[0].toFixed(6)+'  lon '+p[1].toFixed(6)}});
 window.addEventListener('mouseup',()=>pan=null);
-stage.addEventListener('dblclick',e=>{if(!result)return;const p=ll(e);if(!p[2])return;q('input[name=mode][value=sub]').checked=true;$('clat').value=p[0].toFixed(6);$('clon').value=p[1].toFixed(6);replan()});
+stage.addEventListener('dblclick',e=>{if(!result||e.target.closest('#xdims'))return;const p=ll(e);if(!p[2])return;q('input[name=mode][value=sub]').checked=true;$('clat').value=p[0].toFixed(6);$('clon').value=p[1].toFixed(6);replan()});
 window.addEventListener('resize',()=>result&&fit());
-(async()=>{const s=await api('/api/state');$('file').innerHTML=s.files.length?s.files.map(p=>'<option value="'+p+'">'+p.replace(s.data_dir+'/','')+'</option>').join(''):'<option value="">no .cphd files under '+s.data_dir+'</option>';
-  if(s.meta){meta=s.meta;$('file').value=meta.path;showMeta();replan()}enable();
+(async()=>{const s=await refreshFiles();
+  if(s.meta){meta=s.meta;$('file').value=meta.path;showMeta();replan();xreplan()}enable();
+  const xs=await api('/api/xstatus');if(xs.result)showX(xs.result);if(xs.state==='running'){$('xgo').disabled=true;$('xcancel').disabled=false;xpolling=setInterval(xpoll,500)}
   const st=await api('/api/status');if(st.result)showResult(st.result,true);if(st.state==='running'){$('go').disabled=true;$('cancel').disabled=false;polling=setInterval(poll,500)}})();
 </script></body></html>"""
 
 
-def create_app(eng, data_dir):
+def create_app(eng, data_dir, upload_dir=None):
     from flask import Flask, Response, jsonify, request, send_file
     import logging
     app = Flask(__name__)
@@ -794,12 +1237,40 @@ def create_app(eng, data_dir):
     @app.get("/api/state")
     def state():
         files = []
-        if data_dir and os.path.isdir(data_dir):
-            for root, dirs, names in os.walk(data_dir):
-                if root[len(data_dir):].count(os.sep) >= 4:
-                    dirs[:] = []
-                files += [os.path.join(root, n) for n in names if n.lower().endswith(".cphd")]
-        return jsonify(clean(dict(files=sorted(files)[:500], data_dir=data_dir or "", meta=eng.meta(), workers=eng.workers)))
+        for top in (data_dir, upload_dir, eng.out_dir):
+            if top and os.path.isdir(top):
+                for root, dirs, names in os.walk(top):
+                    if root[len(top):].count(os.sep) >= 4:
+                        dirs[:] = []
+                    files += [os.path.join(root, n) for n in names if n.lower().endswith(".cphd")]
+        files = sorted(set(files))
+        return jsonify(clean(dict(files=files[:500], data_dir=data_dir or "", meta=eng.meta(), workers=eng.workers)))
+
+    @app.put("/api/upload")
+    def upload():
+        """The browser sends the file as the raw request body; it is streamed to disk."""
+        name = os.path.basename(request.args.get("name", ""))
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        if not name.lower().endswith(".cphd"):
+            return fail("only .cphd files")
+        if not upload_dir:
+            return fail("uploads are switched off on this server", 403)
+        os.makedirs(upload_dir, exist_ok=True)
+        path = os.path.join(upload_dir, name)
+        tmp = path + ".part"
+        try:
+            with open(tmp, "wb") as fh:
+                while True:
+                    blk = request.stream.read(1 << 24)
+                    if not blk:
+                        break
+                    fh.write(blk)
+            os.replace(tmp, path)
+        except Exception as e:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return fail(f"upload failed: {e}", 500)
+        return jsonify(path=path, size_gb=os.path.getsize(path) / 1e9)
 
     @app.post("/api/load")
     def load():
@@ -837,6 +1308,37 @@ def create_app(eng, data_dir):
     def status():
         return jsonify(clean(eng.status()))
 
+    @app.post("/api/xplan")
+    def xplan():
+        try:
+            return jsonify(clean(eng.xplan(request.get_json(force=True) or {})[1]))
+        except Exception as e:
+            return fail(e)
+
+    @app.post("/api/xrun")
+    def xrun():
+        try:
+            return jsonify(clean(eng.xrun(request.get_json(force=True) or {})))
+        except Exception as e:
+            return fail(e, 409 if isinstance(e, RuntimeError) else 400)
+
+    @app.post("/api/xcancel")
+    def xcancel():
+        eng.xcancel.set()
+        return jsonify(ok=True)
+
+    @app.get("/api/xstatus")
+    def xstatus():
+        return jsonify(clean(eng.xstatus()))
+
+    @app.get("/api/xfile")
+    def xfile():
+        r = eng.xresult
+        if r is None:
+            return fail("no extract yet", 404)
+        path = r["path"] if request.args.get("kind", "cphd") == "cphd" else r["path"][:-5] + ".json"
+        return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+
     @app.get("/api/image.png")
     def image():
         png = eng.png(float(request.args.get("lo", -5)), float(request.args.get("hi", 30)))
@@ -864,6 +1366,7 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, min(64, (os.cpu_count() or 2) - 2)), help="worker processes")
     ap.add_argument("--max-side", type=int, default=1500, help="largest image side, in pixels, when the pixel size is automatic")
     ap.add_argument("--cache-gb", type=float, default=30.0, help="oldest block folders are deleted beyond this size")
+    ap.add_argument("--uploads", default=None, help="folder for CPHDs uploaded from the browser (default <cache>/uploads; 'off' to disable)")
     ap.add_argument("--selftest", action="store_true", help="run the synthetic end-to-end check and exit")
     a = ap.parse_args()
     try:
@@ -878,7 +1381,8 @@ def main():
         m = eng.load(a.cphd)
         print(f"loaded {m['name']}: {m['n_usable']} usable pulses, {m['duration_s']:.2f} s, scene {m['scene_size_m']:.0f} m")
     print(f"CPHD viewer on http://{a.host}:{a.port}  |  {a.workers} workers  |  cache {a.cache}  |  data {a.data}")
-    create_app(eng, a.data).run(host=a.host, port=a.port, threaded=True, use_reloader=False)
+    uploads = None if a.uploads == "off" else (a.uploads or os.path.join(a.cache, "uploads"))
+    create_app(eng, a.data, uploads).run(host=a.host, port=a.port, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":

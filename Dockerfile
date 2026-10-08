@@ -3,6 +3,7 @@
 #   docker run -d --name cphd-viewer --user $(id -u):$(id -g) -p 127.0.0.1:8095:8095 \
 #       -v /path/to/cphd/folder:/data:ro -v /path/to/cache:/cache cphd-viewer
 #   ssh -L 8095:localhost:8095 <server>      then open http://localhost:8095
+#   uploads land in /cache/uploads, extracted chips (.cphd + .json) in /cache/extracts
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
