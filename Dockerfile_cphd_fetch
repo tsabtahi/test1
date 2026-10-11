@@ -1,0 +1,22 @@
+# Umbra open-data CPHD downloader
+#   docker build -t umbra-cphd-fetch .
+#   mkdir -p /home/tabtahi/SATLOCK/dataset/cphd
+#   docker run --rm --user $(id -u):$(id -g) \
+#       -v /path/to/completed_scenes.json:/in/completed_scenes.json:ro \
+#       -v /home/tabtahi/SATLOCK/dataset/cphd:/out \
+#       umbra-cphd-fetch --dry-run          # then --limit 5, then no flag for everything
+#   output: /out/<scene>/<scene>_CPHD.cphd, bucket listing and report in /out/_index/
+#   CPHD files run from about 2 to 55 GB each: read the --dry-run total before the full run
+FROM python:3.13-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN pip install boto3==1.43.111
+
+WORKDIR /app
+COPY umbra_cphd_fetch.py /app/umbra_cphd_fetch.py
+
+ENTRYPOINT ["python", "/app/umbra_cphd_fetch.py"]
+CMD []
