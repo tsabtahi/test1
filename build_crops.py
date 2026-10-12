@@ -20,6 +20,11 @@ For every scene that has both an annotations.json (GEC labels in lat/lon) and a 
     python build_crops.py --selftest             # synthetic end-to-end check, exits 0 on pass
 """
 import argparse, copy, csv, json, math, os, re, shutil, sys, time, traceback
+import tempfile
+# CuPy keeps compiled kernels under ~/.cupy; in a container run with --user the home folder is often "/" and not
+# writable, so point the cache at a writable temp folder unless one is already set.
+if not os.environ.get("CUPY_CACHE_DIR"):
+    os.environ["CUPY_CACHE_DIR"] = os.path.join(tempfile.gettempdir(), f"cupy_cache_{os.getuid()}")
 import numpy as np
 import scipy.fft as sp_fft
 from scipy.signal import firwin, upfirdn
