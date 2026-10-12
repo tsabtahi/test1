@@ -17,6 +17,8 @@ JSON_PATH = r"C:\Users\you\Desktop\crops\crop.json"
 OUT_PNG = r"C:\Users\you\Desktop\crops\crop.png"
 PIXEL_M = 1.0              # 2.0 is 4x faster
 DB_RANGE = (-5, 35)        # display range, dB above the crop median
+H_OVERRIDE = None          # image plane height (m above ellipsoid). None = the crop's h_ref.
+                           # To test the height shift, set it to the GEC's HEIGHT_OFF:  gdalinfo <scene>_GEC.tif | findstr HEIGHT_OFF
 # ------------------------------------------------------------------
 
 C = 299792458.0
@@ -58,6 +60,21 @@ with open(JSON_PATH) as f:
 size_m = meta["grid"]["n"] * meta["grid"]["pixel_m"]
 n = int(round(size_m / PIXEL_M))
 lat0, lon0, h = meta["centre_lat"], meta["centre_lon"], meta["h_ref"]
+if H_OVERRIDE is not None:
+    h = float(H_OVERRIDE)
+
+# viewing geometry at the crop centre, to read the shift: a plane-height error dh moves the scene dh / tan(graze)
+la, lo = math.radians(lat0), math.radians(lon0)
+east = np.array([-math.sin(lo), math.cos(lo), 0.0])
+north = np.array([-math.sin(la) * math.cos(lo), -math.sin(la) * math.sin(lo), math.cos(la)])
+up = np.array([math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la)])
+u = (tx[len(tx) // 2] + rc[len(rc) // 2]) / 2
+u /= np.linalg.norm(u)                                   # crop centre -> radar
+graze = math.degrees(math.asin(u @ up))
+radar_az = math.degrees(math.atan2(u @ east, u @ north)) % 360
+print(f"crop h_ref {meta['h_ref']:.1f} m, image plane at {h:.1f} m")
+print(f"radar is at azimuth {radar_az:.0f} deg (0 = north, 90 = east), graze {graze:.1f} deg")
+print(f"each 10 m of height error moves the scene {10 / math.tan(math.radians(graze)):.1f} m along that azimuth")
 m_lat, m_lon = metres_per_degree(lat0)
 dlat, dlon = PIXEL_M / m_lat, PIXEL_M / m_lon
 lat_n, lon_w = lat0 + n * dlat / 2, lon0 - n * dlon / 2
@@ -107,8 +124,8 @@ for b in meta.get("boxes", []):
     ax.text(x0, y0 - 3, f"{b.get('ann_id')}  {b.get('visible', 1):.0%}", color=colour, fontsize=8)
 ax.set_xlim(0, size_m); ax.set_ylim(size_m, 0)
 ax.set_xlabel("metres east"); ax.set_ylabel("metres south")
-ax.set_title(f"{meta['crop_id']}\n{meta['label']}: {meta['n_pos']} ship(s), {meta['n_ignore']} ignored "
-             f"(green = ship, yellow = ignored)", fontsize=9)
+ax.set_title(f"{meta['crop_id']}   plane h = {h:.1f} m\n{meta['label']}: {meta['n_pos']} ship(s), {meta['n_ignore']} ignored "
+             f"(green = ship, yellow = ignored); radar at az {radar_az:.0f} deg, graze {graze:.0f} deg", fontsize=9)
 fig.tight_layout()
 fig.savefig(OUT_PNG, dpi=130)
 print("saved", OUT_PNG)
