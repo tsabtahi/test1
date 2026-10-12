@@ -31,7 +31,7 @@ SCENE_RE = re.compile(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_UMBRA-\d+")
 
 DEFAULTS = dict(core_m=512.0, pixel_m=1.0, pulses=1024, samples=1024, res_az=1.0, res_rg=1.0, margin=0.25, guard=0.25,
                 stride_m=256.0, jitter_m=64.0, min_visible=0.3, neg_ratio=3.0, neg_empty=8, interp_taps=24,
-                mem_gb=8.0, h_ref=None, seed=0, workers=4)
+                mem_gb=8.0, h_ref=None, seed=0, workers=4, device="cpu", resample="auto", chunk=256)
 
 
 # ------------------------------------------------------------------ coordinates
@@ -364,44 +364,65 @@ class Scene:
         return int(max(1, min(math.floor(W * self.N_t * abs(self.c.scss[self.c.m_ref])), self.S // 2 - 1, (self.N_t - 1) // 2)))
 
 
-def extract_group(sc, plans, workers=4, chunk=256, log=print):
-    """One pass over the pulses that a group of crops needs. Returns {i: P x S complex64}."""
+def get_xp(cfg):
+    """numpy on the CPU, cupy on the GPU; the same code runs on either."""
+    if cfg.get("device") == "gpu":
+        import cupy
+        return cupy
+    return np
+
+
+def _fft(xp, a, inverse, workers):
+    if xp is np:
+        return (sp_fft.ifft if inverse else sp_fft.fft)(a, axis=1, workers=workers)
+    return (xp.fft.ifft if inverse else xp.fft.fft)(a, axis=1)
+
+
+def extract_group(sc, plans, workers=4, chunk=256, log=print, xp=np):
+    """One pass over the pulses that a group of crops needs. Returns {i: (pulses x S) complex64 on the device}."""
     c, S, N_t = sc.c, sc.S, sc.N_t
     lo, hi = min(p["n0"] for p in plans.values()), max(p["n1"] for p in plans.values())
-    buf = {i: np.zeros((p["n1"] - p["n0"], S), np.complex64) for i, p in plans.items()}
+    buf = {i: xp.zeros((p["n1"] - p["n0"], S), xp.complex64) for i, p in plans.items()}
+    tau = {i: xp.asarray(p["tau_c"]) for i, p in plans.items()}
     hb = {i: sc.gate_bins(p["W"]) for i, p in plans.items()}
     nidx = np.arange(N_t)
     t0, t_say = time.time(), time.time()
     with open(c.path, "rb") as f, skcphd.Reader(f) as reader:
         for a in range(lo, hi, chunk):
             b = min(hi, a + chunk)
-            raw = c.read(reader, a, b)
             idx = np.clip(sc.n_s + sc.offs[a:b, None] + nidx[None, :], 0, c.ns - 1)
-            sig = np.take_along_axis(raw, idx, axis=1)
-            freq = c.sc0[a:b, None] + idx * c.scss[a:b, None]
-            ok = c.valid[a:b]
+            sig = xp.asarray(np.take_along_axis(c.read(reader, a, b), idx, axis=1))
+            freq = xp.asarray(c.sc0[a:b, None] + idx * c.scss[a:b, None])
+            bad = xp.asarray(~c.valid[a:b])
             for i, p in plans.items():
                 i0, i1 = max(a, p["n0"]), min(b, p["n1"])
                 if i0 >= i1:
                     continue
                 r = slice(i0 - a, i1 - a)
-                tc = p["tau_c"][i0 - p["n0"]:i1 - p["n0"]]
-                s = sig[r] * np.exp((-c.sgn * 2j * np.pi) * (freq[r] * tc[:, None])).astype(np.complex64)
-                s[~ok[r]] = 0
-                Q = sp_fft.ifft(s, axis=1, workers=workers)          # range profiles; delay 0 = crop centre
+                tc = tau[i][i0 - p["n0"]:i1 - p["n0"]]
+                s = sig[r] * xp.exp((-c.sgn * 2j * np.pi) * (freq[r] * tc[:, None])).astype(xp.complex64)
+                s[bad[r]] = 0
+                Q = _fft(xp, s, True, workers)                       # range profiles; delay 0 = crop centre
                 h = hb[i]
-                Qc = np.zeros((i1 - i0, S), np.complex64)
+                Qc = xp.zeros((i1 - i0, S), xp.complex64)
                 Qc[:, :h + 1] = Q[:, :h + 1]                         # keep |delay| <= W, place on S bins
                 Qc[:, S - h:] = Q[:, N_t - h:]
-                buf[i][i0 - p["n0"]:i1 - p["n0"]] = sp_fft.fft(Qc, axis=1, workers=workers)
+                buf[i][i0 - p["n0"]:i1 - p["n0"]] = _fft(xp, Qc, False, workers)
             if time.time() - t_say > 30:
                 log(f"    pulses {b - lo:,} of {hi - lo:,}, {time.time() - t0:.0f} s")
                 t_say = time.time()
     return buf
 
 
-def resample_slow_time(sc, p, Y):
-    """Low-pass the crop's Doppler band, decimate, then windowed-sinc resample to the P output angles."""
+def resample_slow_time(sc, p, Y, xp=np, method="auto"):
+    """Low-pass the crop's Doppler band and resample to the P output angles. Returns P x S complex64 (host).
+
+    upfirdn: polyphase low-pass and decimation, then a short windowed-sinc interpolation (CPU default).
+    direct:  one windowed-sinc low-pass evaluated at each output's fractional pulse position (GPU default)."""
+    if method == "auto":
+        method = "upfirdn" if xp is np else "direct"
+    if method == "direct":
+        return resample_direct(sc, p, Y, xp)
     T, beta = sc.cfg["interp_taps"], 8.0
     if p["cut"] < 0.5:
         h = firwin(p["L"], p["cut"], window=("kaiser", 7.0), fs=1.0)
@@ -412,15 +433,35 @@ def resample_slow_time(sc, p, Y):
     J = np.floor(u).astype(np.int64)[:, None] - (T // 2 - 1) + np.arange(T)[None, :]
     d = u[:, None] - J
     w = np.sinc(d) * np.i0(beta * np.sqrt(np.clip(1 - (2 * d / T) ** 2, 0, None))) / np.i0(beta)
+    return _apply_taps(J, w, Z, np)
+
+
+def resample_direct(sc, p, Y, xp):
+    """out[k] = sum_n h(t_k - n) Y[n], h a Kaiser-windowed sinc low-pass at the crop's Doppler cut-off."""
+    tk = p["t_k"] - p["n0"]
+    if p["cut"] < 0.5:
+        cut, half, beta = p["cut"], (p["L"] - 1) // 2 + 1, 7.0
+    else:
+        cut, half, beta = 0.5, sc.cfg["interp_taps"] // 2, 8.0
+    J = np.floor(tk).astype(np.int64)[:, None] - (half - 1) + np.arange(2 * half)[None, :]
+    d = tk[:, None] - J
+    w = 2 * cut * np.sinc(2 * cut * d) * np.i0(beta * np.sqrt(np.clip(1 - (d / half) ** 2, 0, None))) / np.i0(beta)
+    return _apply_taps(J, w, Y, xp)
+
+
+def _apply_taps(J, w, Z, xp):
+    """Rows of taps (indices J, weights w, P x T, host) applied to Z (n x S, on the device). Returns host array."""
     inside = (J >= 0) & (J < Z.shape[0])
     w = np.where(inside, w, 0.0)
     w /= w.sum(1, keepdims=True)
     J = np.clip(J, 0, Z.shape[0] - 1)
-    out = np.empty((len(u), Z.shape[1]), np.complex64)
-    for k0 in range(0, len(u), 64):
-        k1 = min(len(u), k0 + 64)
-        out[k0:k1] = np.einsum("pt,pts->ps", w[k0:k1].astype(np.complex64), Z[J[k0:k1]])
-    return out
+    P, T = J.shape
+    rows = max(1, int(2.5e8 // (T * Z.shape[1] * 8)))               # keep the gathered block near 250 MB
+    out = xp.empty((P, Z.shape[1]), xp.complex64)
+    for k0 in range(0, P, rows):
+        k1 = min(P, k0 + rows)
+        out[k0:k1] = xp.einsum("pt,pts->ps", xp.asarray(w[k0:k1].astype(np.complex64)), Z[xp.asarray(J[k0:k1])])
+    return out if xp is np else xp.asnumpy(out)
 
 
 def interp_pvp(sc, t_k):
@@ -582,7 +623,13 @@ def process_scene(ann, cphd_path, out_dir, cfg, dry_run=False, overwrite=False, 
         meta = dict(tree=copy.deepcopy(r.metadata.xmltree))
         meta["support"] = {s.findtext("{*}Identifier"): r.read_support_array(s.findtext("{*}Identifier"))
                            for s in meta["tree"].findall("{*}Data/{*}SupportArray")}
+    xp = get_xp(cfg)
     budget = cfg["mem_gb"] * 1e9 * 0.5
+    if xp is not np:                                         # GPU: buffers live in device memory
+        free, total = xp.cuda.runtime.memGetInfo()
+        budget = min(budget, 0.35 * free)
+        log(f"  GPU {xp.cuda.runtime.getDeviceProperties(xp.cuda.Device().id)['name'].decode()}: "
+            f"{free / 1e9:.1f} of {total / 1e9:.1f} GB free, buffer budget {budget / 1e9:.1f} GB")
     groups, cur, size = [], {}, 0
     for k in sorted(todo, key=lambda k: todo[k][1]["n0"]):
         b = todo[k][1]["bytes"]
@@ -593,9 +640,10 @@ def process_scene(ann, cphd_path, out_dir, cfg, dry_run=False, overwrite=False, 
         groups.append(cur)
     for gi, grp in enumerate(groups):
         log(f"  group {gi + 1} of {len(groups)}: {len(grp)} crops, {sum(v[1]['bytes'] for v in grp.values()) / 1e9:.1f} GB buffer")
-        bufs = extract_group(sc, {k: v[1] for k, v in grp.items()}, workers=cfg["workers"], log=log)
+        bufs = extract_group(sc, {k: v[1] for k, v in grp.items()}, workers=cfg["workers"], log=log, xp=xp,
+                             chunk=cfg["chunk"] if xp is np else max(cfg["chunk"], 1024))
         for k, (rec, p) in grp.items():
-            Z = resample_slow_time(sc, p, bufs.pop(k))
+            Z = resample_slow_time(sc, p, bufs.pop(k), xp, cfg["resample"])
             path = os.path.join(sdir, k + ".cphd")
             write_crop(sc, meta, p, Z, path, rec["grid"].bounds)
             g = rec["grid"]
@@ -618,6 +666,9 @@ def process_scene(ann, cphd_path, out_dir, cfg, dry_run=False, overwrite=False, 
             with open(path[:-5] + ".json.part", "w") as fh:
                 json.dump(label, fh, indent=1, default=float)
             os.replace(path[:-5] + ".json.part", path[:-5] + ".json")
+        del bufs
+        if xp is not np:
+            xp.get_default_memory_pool().free_all_blocks()
         log(f"    written, {time.time() - t_scene:.0f} s so far")
     lines = []
     for k in sorted(plans):
@@ -650,6 +701,18 @@ def run(args, cfg, log=print):
         anns = [a for a in anns if any(s in a["scene"] for s in args.scenes)]
     if args.limit:
         anns = anns[:args.limit]
+    shard = getattr(args, "shard", None)
+    if shard:                                               # i/N: largest CPHDs spread first, greedy by size
+        i, n = map(int, shard.split("/"))
+        size = lambda a: os.path.getsize(cidx[a["scene"]]) if a["scene"] in cidx else 0
+        load, mine = [0] * n, []
+        for a in sorted(anns, key=size, reverse=True):
+            j = int(np.argmin(load))
+            load[j] += size(a) + 1
+            if j == i:
+                mine.append(a)
+        anns = sorted(mine, key=lambda a: a["scene"])
+        log(f"shard {i}/{n}: {len(anns)} scenes, {load[i] / 1e9:.1f} GB of CPHD")
     os.makedirs(args.out, exist_ok=True)
     rows, all_lines = [], []
     for i, a in enumerate(anns):
@@ -666,7 +729,8 @@ def run(args, cfg, log=print):
         except Exception as e:
             traceback.print_exc()
             rows.append(dict(scene=a["scene"], status=f"failed: {type(e).__name__}: {e}", boxes=len(a["anns"])))
-    report = os.path.join(args.out, "crop_report_dry_run.csv" if args.dry_run else "crop_report.csv")
+    tag = f"_shard{shard.split('/')[0]}" if shard else ""
+    report = os.path.join(args.out, ("crop_report_dry_run" if args.dry_run else "crop_report") + tag + ".csv")
     keys = []
     for r in rows:
         keys += [k for k in r if k not in keys]
@@ -674,22 +738,27 @@ def run(args, cfg, log=print):
         w = csv.DictWriter(fh, fieldnames=keys)
         w.writeheader()
         w.writerows(rows)
-    if not args.dry_run:                                    # whole-run manifest from every scene folder on disk
-        lines = []
-        for d in sorted(os.listdir(args.out)):
-            mp = os.path.join(args.out, d, "manifest.jsonl")
-            if os.path.isfile(mp):
-                with open(mp) as fh:
-                    lines += fh.readlines()
-        with open(os.path.join(args.out, "manifest.jsonl"), "w") as fh:
-            fh.writelines(lines)
-        n_pos = sum('"label": "positive"' in l for l in lines)
-        log(f"\nmanifest: {len(lines)} crops ({n_pos} positive, {len(lines) - n_pos} negative)")
+    if not args.dry_run and not shard:                      # whole-run manifest from every scene folder on disk
+        write_run_manifest(args.out, log)
     tot = sum(r.get("crops", 0) for r in rows)
     gb = sum(r.get("est_gb", 0) for r in rows)
     log(f"{len(rows)} scenes, {sum(r.get('status') in ('done', 'planned') for r in rows)} usable, {tot} crops, "
         f"about {gb:.1f} GB. Report: {report}")
     return rows
+
+
+def write_run_manifest(out, log=print):
+    if True:
+        lines = []
+        for d in sorted(os.listdir(out)):
+            mp = os.path.join(out, d, "manifest.jsonl")
+            if os.path.isfile(mp):
+                with open(mp) as fh:
+                    lines += fh.readlines()
+        with open(os.path.join(out, "manifest.jsonl"), "w") as fh:
+            fh.writelines(lines)
+        n_pos = sum('"label": "positive"' in l for l in lines)
+        log(f"\nmanifest: {len(lines)} crops ({n_pos} positive, {len(lines) - n_pos} negative)")
 
 
 # ------------------------------------------------------------------ synthetic data and self-test
@@ -860,12 +929,58 @@ def selftest(work, workers=2):
         ok &= good
         print(f"  imaged from the crop CPHD: ship 1 within {off_m:.2f} m of truth, 3 dB width {irw_n:.2f} m cross-range x "
               f"{irw_e:.2f} m range; ship 2 (outside the crop) at {leak:.1f} dB | {'ok' if good else 'FAIL'}")
+    scene = scenes[0][0]                                    # the GPU resampler (direct taps) against the CPU one (upfirdn)
+    sc = Scene(CPHD(os.path.join(cphd_root, scene, f"{scene}_CPHD.cphd")), cfg)
+    p, _ = sc.plan(truths[scene][0]["lat"], truths[scene][0]["lon"])
+    Y = extract_group(sc, {"x": p}, workers=workers)["x"]
+    za, zb = resample_slow_time(sc, p, Y, np, "upfirdn"), resample_slow_time(sc, p, Y, np, "direct")
+    corr = float(np.abs(np.vdot(za, zb)) / (np.linalg.norm(za) * np.linalg.norm(zb)))
+    good = corr > 0.999
+    ok &= good
+    print(f"direct-tap resampler (GPU path) vs upfirdn: correlation {corr:.5f} | {'ok' if good else 'FAIL'}")
     neg = [m for m in man if m["label"] == "negative"]
     good = bool(neg) and all(m["n_pos"] == 0 for m in neg)
     ok &= good
     print(f"negatives: {len(neg)}, none with a box | {'ok' if good else 'FAIL'}")
     print("SELF-TEST", "PASSED" if ok else "FAILED")
     return ok
+
+
+def launch(a, argv):
+    """One child process per GPU (or per --procs), each taking a share of the scenes; then one manifest."""
+    if a.gpus:
+        slots = [dict(CUDA_VISIBLE_DEVICES=g.strip()) for g in a.gpus.split(",") if g.strip()]
+        extra = ["--device", "gpu"]
+    else:
+        slots, extra = [dict() for _ in range(a.procs)], []
+    skip, rest = False, []
+    for x in argv:                                          # pass every flag through except the launcher's own
+        if skip:
+            skip = False
+            continue
+        if x in ("--gpus", "--procs"):
+            skip = True
+            continue
+        if x.startswith(("--gpus=", "--procs=")):
+            continue
+        rest.append(x)
+    os.makedirs(os.path.join(a.out, "_logs"), exist_ok=True)
+    import subprocess
+    procs = []
+    for i, env in enumerate(slots):
+        log_path = os.path.join(a.out, "_logs", f"shard{i}.log")
+        cmd = [sys.executable, os.path.abspath(__file__)] + rest + extra + ["--shard", f"{i}/{len(slots)}"]
+        print(f"shard {i}: {' '.join(f'{k}={v}' for k, v in env.items()) or 'cpu'}, log {log_path}", flush=True)
+        procs.append((i, subprocess.Popen(cmd, env=dict(os.environ, **env), stdout=open(log_path, "w"),
+                                          stderr=subprocess.STDOUT)))
+    failed = 0
+    for i, p in procs:
+        rc = p.wait()
+        failed += rc != 0
+        print(f"shard {i} finished with exit code {rc}", flush=True)
+    if not a.dry_run:
+        write_run_manifest(a.out)
+    return 1 if failed else 0
 
 
 def main():
@@ -883,12 +998,17 @@ def main():
             ap.add_argument("--h-ref", type=float, default=None, help="plane height above the ellipsoid, m (default: CPHD reference point)")
             continue
         ap.add_argument("--" + k.replace("_", "-"), type=type(v), default=v)
+    ap.add_argument("--gpus", default="", help="comma-separated GPU ids, e.g. 0,1,2,3: one process per GPU, scenes shared out")
+    ap.add_argument("--procs", type=int, default=1, help="CPU processes, scenes shared out (ignored with --gpus)")
+    ap.add_argument("--shard", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-dir", default="./cphd_crops_selftest")
     a = ap.parse_args()
     cfg = {k: getattr(a, k) for k in DEFAULTS}
     if a.selftest:
         sys.exit(0 if selftest(a.selftest_dir, a.workers) else 1)
+    if (a.gpus or a.procs > 1) and not a.shard:
+        sys.exit(launch(a, sys.argv[1:]))
     run(a, cfg)
 
 
