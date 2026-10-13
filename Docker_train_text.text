@@ -18,15 +18,19 @@
 # needs an NVIDIA driver (CUDA 12.x, driver >= 525) and the NVIDIA container toolkit (docker run --gpus all).
 FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 TORCH_HOME=/app/torch \
-    HOME=/tmp CUPY_CACHE_DIR=/tmp/cupy_cache MPLCONFIGDIR=/tmp/matplotlib
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 TORCH_HOME=/app/torch
 
 RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 \
  && pip install sarkit==1.12.0 pyproj lxml scipy "cupy-cuda12x[ctk]" \
  && python -c "import torchvision; torchvision.models.resnet50(weights='DEFAULT'); torchvision.models.resnet18(weights='DEFAULT')" \
  && chmod -R a+rX /app/torch
 
+RUN pip install tensorboard
+
+# writable caches for any --user (CuPy kernel cache, matplotlib); after the pip layer so it stays cached
+ENV HOME=/tmp CUPY_CACHE_DIR=/tmp/cupy_cache MPLCONFIGDIR=/tmp/matplotlib
+
 WORKDIR /app
-COPY build_crops.py train_detector.py train_raw.py png_output.py /app/
+COPY build_crops.py train_detector.py train_raw.py train_viz.py png_output.py /app/
 ENTRYPOINT ["python"]
 CMD ["/app/train_detector.py", "--help"]
