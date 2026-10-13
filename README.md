@@ -15,4 +15,6 @@ docker run -d --rm --name ftrain --gpus '"device=3"' --ipc=host --user $(id -u):
   -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops:ro -v /home/tabtahi/SATLOCK/runs:/runs \
   --entrypoint torchrun cphd-gpu --nproc_per_node=4 /app/train_raw.py train \
   --crops /crops --ann-root /ann --out /runs/fourier_full --arch fourier --amp --batch 8
+
+for c in $(docker ps -q); do echo "$(docker inspect -f '{{.Name}}  GPUs: {{.HostConfig.DeviceRequests}}' $c)"; done
 ```
