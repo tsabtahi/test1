@@ -15,6 +15,13 @@ docker run -d --name tb --rm -p 127.0.0.1:6006:6006 --user $(id -u):$(id -g) \
     --entrypoint tensorboard cphd-gpu --logdir /runs --host 0.0.0.0 --port 6006
 
 cd ~/SATLOCK/dataset
+for d in cphd_crops/*/; do
+  s=$(basename "$d")
+  [ -f "$d/manifest.jsonl" ] && ls cphd/$s/*.cphd 2>/dev/null
+done > cropped_cphds.txt
+wc -l cropped_cphds.txt; du -ch $(cat cropped_cphds.txt) | tail -1    # how many, how much space
+
+cd ~/SATLOCK/dataset
 ls /data3/sandbox/jhu/satlock/annotation_tool/test_aligned | sed 's/_GEC$//' > all_scenes.txt
 ls -d cphd_crops/*/ | xargs -n1 basename | while read s; do
   [ -f cphd_crops/$s/manifest.jsonl ] && echo $s; done > done_scenes.txt
