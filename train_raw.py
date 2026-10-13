@@ -34,6 +34,7 @@ import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import train_detector as td                                           # data reading, sampler, metrics, GeoJSON
+from fourier_net import FourierShipNet
 import train_viz as tv                                                # dataset stats, TensorBoard, collages
 
 C = 299792458.0
@@ -367,7 +368,12 @@ def evaluate(model, loader, device, cfg, score_thr=0.5):
 def cfg_of(a):
     return dict(cells=a.cells, cell_m=a.cell_m, shift_m=a.shift_m, min_visible=a.min_visible, max_objs=a.max_objs,
                 pulses=a.pulses, samples=a.samples, patch=a.patch, dim=a.dim, depth=a.depth, heads=a.heads,
-                dec_dim=a.dec_dim, dec_heads=a.dec_heads, dec_layers=a.dec_layers, giou_weight=a.giou_weight, amp=a.amp)
+                dec_dim=a.dec_dim, dec_heads=a.dec_heads, dec_layers=a.dec_layers, giou_weight=a.giou_weight, amp=a.amp,
+                arch=a.arch, pretrained=not a.no_pretrained, fixed_dft=a.fixed_dft)
+
+
+def build_model(cfg):
+    return FourierShipNet(cfg) if cfg.get("arch", "vit") == "fourier" else RawShipNet(cfg)
 
 
 def train(a):
@@ -402,14 +408,19 @@ def train(a):
     dl = torch.utils.data.DataLoader(tr, batch_size=a.batch, sampler=sampler, num_workers=a.workers, collate_fn=collate,
                                      pin_memory=device.type == "cuda", persistent_workers=a.workers > 0, drop_last=True)
     vdl = torch.utils.data.DataLoader(va, batch_size=a.batch, shuffle=False, num_workers=a.workers, collate_fn=collate)
-    model = RawShipNet(cfg).to(device)
+    model = build_model(cfg).to(device)
     say(f"model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f} M parameters")
     if a.resume:
         model.load_state_dict(torch.load(a.resume, map_location="cpu", weights_only=False)["model"])
     if world > 1:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda" else None)
     core = model.module if world > 1 else model
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.05)
+    front = set(id(p) for p in core.front_parameters()) if hasattr(core, "front_parameters") else set()
+    groups = [dict(params=[p for p in model.parameters() if id(p) not in front and p.requires_grad])]
+    fp = [p for p in model.parameters() if id(p) in front and p.requires_grad]
+    if fp:                                                  # the learnable transform moves slowly, no weight decay
+        groups.append(dict(params=fp, lr=a.lr * a.front_lr_scale, weight_decay=0.0))
+    opt = torch.optim.AdamW(groups, lr=a.lr, weight_decay=0.05)
     steps = a.max_iters or a.epochs * len(dl)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / a.warmup) *
                                               0.5 * (1 + math.cos(math.pi * min(s, steps) / max(steps, 1))))
@@ -496,7 +507,7 @@ def predict(a):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     st = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     cfg = st["cfg"]
-    model = RawShipNet(cfg).to(device)
+    model = build_model(cfg).to(device)
     model.load_state_dict(st["model"])
     entries = td.read_manifest(a.crops)
     if a.scenes:
@@ -632,6 +643,11 @@ def parser():
     t.add_argument("--dec-layers", type=int, default=2)
     t.add_argument("--giou-weight", type=float, default=1.0)
     t.add_argument("--amp", action="store_true", help="bfloat16 autocast on GPU")
+    t.add_argument("--arch", choices=["vit", "fourier"], default="fourier",
+                   help="fourier: learnable DFT front end + CNN (default); vit: patch ViT encoder + cell decoder")
+    t.add_argument("--no-pretrained", action="store_true", help="fourier: ResNet-18 stem from scratch")
+    t.add_argument("--fixed-dft", action="store_true", help="fourier: keep the transform and taper fixed")
+    t.add_argument("--front-lr-scale", type=float, default=0.1, help="fourier: learning-rate factor for the transform")
     p = sub.add_parser("predict")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--crops", required=True)
