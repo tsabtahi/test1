@@ -10,4 +10,8 @@ docker run -d --rm --name ftrain4 --gpus '"device=A,B,C,D"' --ipc=host --user $(
   --crops /crops --ann-root /ann --arch fourier --amp --batch 8 \
   --resume /runs/fourier_full_r1/last.pt --out /runs/fourier_full_r2 \
   --epochs 250 --samples-per-epoch 4000 --collage-every 5
+
+docker run -d --rm --name tb --user $(id -u):$(id -g) -p 6006:6006 \
+  -v /home/tabtahi/SATLOCK/runs:/runs:ro \
+  --entrypoint tensorboard cphd-gpu --logdir /runs --host 0.0.0.0 --port 6006 --reload_interval 60
 ```
