@@ -1,25 +1,36 @@
-# CPHD ground-projection viewer
-#   docker build -t cphd-viewer .
-#   docker run -d --name cphd-viewer --user $(id -u):$(id -g) -p 127.0.0.1:8095:8095 \
-#       -v /path/to/cphd/folder:/data:ro -v /path/to/cache:/cache cphd-viewer
-#   ssh -L 8095:localhost:8095 <server>      then open http://localhost:8095
-#   uploads land in /cache/uploads, extracted chips (.cphd + .json) in /cache/extracts
-FROM python:3.13-slim
+# CPHD ship detection on GPUs: crop builder (CuPy) and detector training (PyTorch) in one image
+#   docker build -t cphd-gpu .
+#
+# Crops on several GPUs (one process per GPU, scenes shared out):
+#   docker run -d --name crops --gpus all --user $(id -u):$(id -g) \
+#       -v /data3/sandbox/jhu/satlock/annotation_tool/test_aligned:/ann:ro \
+#       -v /home/tabtahi/SATLOCK/dataset/cphd:/cphd:ro -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/out \
+#       cphd-gpu build_crops.py --ann-root /ann --cphd-root /cphd --out /out --gpus 0,1,2,3
+#
+# Training on 4 GPUs:
+#   docker run -d --name train --gpus all --ipc=host --user $(id -u):$(id -g) -e HOME=/tmp \
+#       -v /data3/sandbox/jhu/satlock/annotation_tool/test_aligned:/ann:ro \
+#       -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops:ro -v /home/tabtahi/SATLOCK/runs:/runs \
+#       --entrypoint torchrun cphd-gpu --nproc_per_node=4 /app/train_detector.py train \
+#       --crops /crops --ann-root /ann --out /runs/r1
+#   raw phase-history model: same line with /app/train_raw.py in place of /app/train_detector.py
+# Python 3.12 (sarkit 1.12 needs >= 3.12). The PyTorch CUDA 12.6 wheels bring their own CUDA libraries; the host only
+# needs an NVIDIA driver (CUDA 12.x, driver >= 525) and the NVIDIA container toolkit (docker run --gpus all).
+FROM python:3.12-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 TORCH_HOME=/app/torch
 
-RUN pip install \
-        numpy==2.5.3 scipy==1.18.1 pandas==3.0.5 lxml==6.1.3 \
-        sarkit==1.12.0 pyproj==3.8.0 rasterio==1.5.2 \
-        flask==3.1.3 pillow==12.3.0
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 \
+ && pip install sarkit==1.12.0 pyproj lxml scipy "cupy-cuda12x[ctk]" \
+ && python -c "import torchvision; torchvision.models.resnet50(weights='DEFAULT'); torchvision.models.resnet18(weights='DEFAULT')" \
+ && chmod -R a+rX /app/torch
+
+RUN pip install tensorboard
+
+# writable caches for any --user (CuPy kernel cache, matplotlib); after the pip layer so it stays cached
+ENV HOME=/tmp CUPY_CACHE_DIR=/tmp/cupy_cache MPLCONFIGDIR=/tmp/matplotlib
 
 WORKDIR /app
-COPY cphd_viewer.py /app/cphd_viewer.py
-RUN mkdir -p /data /cache && chmod 777 /cache
-
-EXPOSE 8095
-ENTRYPOINT ["python", "/app/cphd_viewer.py"]
-CMD ["--data", "/data", "--cache", "/cache", "--port", "8095"]
+COPY build_crops.py train_detector.py train_raw.py train_viz.py fourier_net.py png_output.py /app/
+ENTRYPOINT ["python"]
+CMD ["/app/train_detector.py", "--help"]
