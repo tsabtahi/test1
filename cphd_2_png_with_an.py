@@ -89,8 +89,19 @@ tx = np.asarray(pv["TxPos"], float) - srp
 rc = np.asarray(pv["RcvPos"], float) - srp
 f0 = np.asarray(pv["SC0"], float)
 scss = float(pv["SCSS"][P // 2])
+# viewing geometry at the centre: radar direction and grazing angle (a plane-height change dh moves points
+# dh x tan(graze) on the ground, along the radar direction)
+_la, _lo = math.radians(lat0), math.radians(lon0)
+_E = np.array([-math.sin(_lo), math.cos(_lo), 0.0])
+_N = np.array([-math.sin(_la) * math.cos(_lo), -math.sin(_la) * math.sin(_lo), math.cos(_la)])
+_U = np.array([math.cos(_la) * math.cos(_lo), math.cos(_la) * math.sin(_lo), math.sin(_la)])
+_u = (tx[P // 2] + rc[P // 2]) / 2
+_u /= np.linalg.norm(_u)
+graze = math.degrees(math.asin(_u @ _U))
+radar_az = math.degrees(math.atan2(_u @ _E, _u @ _N)) % 360
 print(f"{os.path.basename(CPHD_PATH)}: {P} pulses x {S} samples, centre {lat0:.6f}, {lon0:.6f}, "
-      f"plane {h:.2f} m (SRP {h_srp:.2f} m), image {size_m:.0f} m at {PIXEL_M} m")
+      f"plane {h:.2f} m (SRP {h_srp:.2f} m), image {size_m:.0f} m at {PIXEL_M} m; radar az {radar_az:.0f} deg, "
+      f"graze {graze:.1f} deg (10 m of height = {10 * math.tan(math.radians(graze)):.1f} m on the ground)")
 
 # 2. north-up lat/lon pixel grid on the plane at height h, positions relative to the chip centre
 n = int(round(size_m / PIXEL_M))
@@ -153,7 +164,8 @@ try:
         dst.write(db, 2)
         dst.set_band_description(1, "amplitude")
         dst.set_band_description(2, "dB above median")
-        dst.update_tags(SOURCE_CPHD=os.path.basename(CPHD_PATH), PLANE_HEIGHT_HAE_M=f"{h:.3f}", PIXEL_M=str(PIXEL_M))
+        dst.update_tags(SOURCE_CPHD=os.path.basename(CPHD_PATH), PLANE_HEIGHT_HAE_M=f"{h:.3f}", PIXEL_M=str(PIXEL_M),
+                        GRAZE_DEG=f"{graze:.4f}", RADAR_AZIMUTH_DEG=f"{radar_az:.4f}")
     print("saved", OUT_BASE + ".tif (GeoTIFF, EPSG:4326)")
 except ImportError:
     import tifffile
