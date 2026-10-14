@@ -1,7 +1,20 @@
-"""Make a PNG of one CPHD crop with its label boxes, to check the boxes sit on the ships.
+"""Make a PNG of one CPHD crop with its label boxes, imaged at the water-surface height, with the boxes moved for height.
 
-Set the three paths below, then:  python crop_to_png.py
-Needs: pip install numpy sarkit matplotlib
+Why: ships sit on the water. The water's ellipsoid height is  h_water = geoid undulation N(lat, lon) + water level above
+mean sea level (0 at sea; e.g. about 174 m for Lake Erie). The crop CPHD is formed at h_ref (the CPHD reference height)
+and the GEC labels were geocoded at the GEC's own height (RPC HEIGHT_OFF). A point at height h shows up on a plane at
+height p moved by (h - p) x tan(graze) towards the radar (layover; 10 m at 35 deg graze = 7 m, at 68 deg = 25 m). So this script
+  1. images the crop on the plane h_water, so ships appear at their true ground position, and
+  2. moves every label box from the GEC plane to the true position:  shift = (h_water - h_gec) x tan(graze), away
+     from the radar,
+and draws the original boxes (orange, dashed) and the moved boxes (green) so you can see which ones sit on the ships.
+
+The crop's lat/lon (centre_lat, centre_lon) and h_ref come from the crop JSON; the radar direction and graze come from
+the CPHD's antenna positions. N comes from the EGM2008 geoid through pyproj (needs internet the first time, to fetch
+the grid) unless you type it in GEOID_N.
+
+Set the paths below, then:  python crop_to_png.py
+Needs: pip install numpy sarkit matplotlib pyproj
 """
 import json, math
 import numpy as np
@@ -17,8 +30,14 @@ JSON_PATH = r"C:\Users\you\Desktop\crops\crop.json"
 OUT_PNG = r"C:\Users\you\Desktop\crops\crop.png"
 PIXEL_M = 1.0              # 2.0 is 4x faster
 DB_RANGE = (-5, 35)        # display range, dB above the crop median
-H_OVERRIDE = None          # image plane height (m above ellipsoid). None = the crop's h_ref.
-                           # To test the height shift, set it to the GEC's HEIGHT_OFF:  gdalinfo <scene>_GEC.tif | findstr HEIGHT_OFF
+OUT_JSON = None            # e.g. r"...\crop_boxes_moved.json": also save the moved boxes (lat/lon)
+
+WATER_LEVEL_MSL = 0.0      # water surface above mean sea level, m: 0 at sea, about 174 for Lake Erie, a lake's elevation
+GEOID_N = None             # geoid undulation N at the crop, m. None = look it up (EGM2008 via pyproj)
+GEC_HEIGHT = None          # height the GEC / labels were geocoded at (RPC HEIGHT_OFF), m above ellipsoid:
+                           #   gdalinfo <scene>_GEC.tif | findstr HEIGHT_OFF
+                           # None = assume the labels were made at the crop's h_ref (then only the image moves)
+IMAGE_HEIGHT = "water"     # "water" = image at h_water; "h_ref" = at the crop's own height; or a number in metres
 # ------------------------------------------------------------------
 
 C = 299792458.0
@@ -30,6 +49,23 @@ def llh_to_ecef(lat, lon, h):
     n = A / np.sqrt(1 - E2 * np.sin(la) ** 2)
     return np.stack([(n + h) * np.cos(la) * np.cos(lo), (n + h) * np.cos(la) * np.sin(lo),
                      (n * (1 - E2) + h) * np.sin(la)], -1)
+
+
+def geoid_undulation(lat, lon):
+    """EGM2008 geoid height above the WGS-84 ellipsoid, metres (EGM96 if EGM2008 is not available)."""
+    import pyproj
+    from pyproj import Transformer
+    pyproj.network.set_network_enabled(True)               # lets PROJ fetch the geoid grid on first use
+    for vert in ("3855", "5773"):                          # EGM2008 height, EGM96 height
+        try:
+            t = Transformer.from_crs("EPSG:4979", f"EPSG:4326+{vert}", always_xy=True, only_best=True)
+            _, _, H = t.transform(lon, lat, 0.0)            # orthometric height of the ellipsoid surface = -N
+            if np.isfinite(H) and abs(H) > 1e-6:
+                return -float(H), "EGM2008" if vert == "3855" else "EGM96"
+        except Exception as e:
+            last = e
+    raise RuntimeError("no geoid grid available (offline?): set GEOID_N by hand, e.g. from "
+                       "https://geographiclib.sourceforge.io/cgi-bin/GeoidEval")
 
 
 def metres_per_degree(lat):
@@ -59,11 +95,17 @@ with open(JSON_PATH) as f:
 # 2. the output grid: north-up, regular in lat/lon, centred on the crop (same as the labels)
 size_m = meta["grid"]["n"] * meta["grid"]["pixel_m"]
 n = int(round(size_m / PIXEL_M))
-lat0, lon0, h = meta["centre_lat"], meta["centre_lon"], meta["h_ref"]
-if H_OVERRIDE is not None:
-    h = float(H_OVERRIDE)
+lat0, lon0, h_ref = meta["centre_lat"], meta["centre_lon"], float(meta["h_ref"])
+if GEOID_N is None:
+    N_geoid, src = geoid_undulation(lat0, lon0)
+else:
+    N_geoid, src = float(GEOID_N), "typed in"
+h_water = N_geoid + WATER_LEVEL_MSL
+h_gec = h_ref if GEC_HEIGHT is None else float(GEC_HEIGHT)
+h = {"water": h_water, "h_ref": h_ref}.get(IMAGE_HEIGHT, None)
+h = float(IMAGE_HEIGHT) if h is None else h
 
-# viewing geometry at the crop centre, to read the shift: a plane-height error dh moves the scene dh / tan(graze)
+# viewing geometry at the crop centre, to read the shift: a plane-height error dh moves the scene dh x tan(graze)
 la, lo = math.radians(lat0), math.radians(lon0)
 east = np.array([-math.sin(lo), math.cos(lo), 0.0])
 north = np.array([-math.sin(la) * math.cos(lo), -math.sin(la) * math.sin(lo), math.cos(la)])
@@ -72,9 +114,19 @@ u = (tx[len(tx) // 2] + rc[len(rc) // 2]) / 2
 u /= np.linalg.norm(u)                                   # crop centre -> radar
 graze = math.degrees(math.asin(u @ up))
 radar_az = math.degrees(math.atan2(u @ east, u @ north)) % 360
-print(f"crop h_ref {meta['h_ref']:.1f} m, image plane at {h:.1f} m")
-print(f"radar is at azimuth {radar_az:.0f} deg (0 = north, 90 = east), graze {graze:.1f} deg")
-print(f"each 10 m of height error moves the scene {10 / math.tan(math.radians(graze)):.1f} m along that azimuth")
+tg = math.tan(math.radians(graze))
+toward = np.array([u @ east, u @ north])
+toward /= np.linalg.norm(toward)                          # ground direction towards the radar (east, north)
+print(f"crop centre {lat0:.6f}, {lon0:.6f}; radar at azimuth {radar_az:.0f} deg (0 = north), graze {graze:.1f} deg")
+print(f"geoid N {N_geoid:.2f} m ({src}) + water level {WATER_LEVEL_MSL:.1f} m = h_water {h_water:.2f} m")
+print(f"crop h_ref {h_ref:.2f} m, labels (GEC) at {h_gec:.2f} m{' (assumed = h_ref)' if GEC_HEIGHT is None else ''}, "
+      f"image plane at {h:.2f} m")
+# a point at height a on a plane at height b appears (a - b) x tan(graze) towards the radar.
+# label boxes sit where the GEC plane put the ships; on our plane h they belong (h_gec - h) x tan(graze) towards the radar
+move_m = (h_gec - h) * tg
+dE, dN = move_m * toward
+print(f"ships on this image plane are {(h_water - h) * tg:+.1f} m towards the radar from their true position")
+print(f"boxes moved {move_m:+.1f} m towards the radar (east {dE:+.1f} m, north {dN:+.1f} m)")
 m_lat, m_lon = metres_per_degree(lat0)
 dlat, dlon = PIXEL_M / m_lat, PIXEL_M / m_lon
 lat_n, lon_w = lat0 + n * dlat / 2, lon0 - n * dlon / 2
@@ -112,20 +164,31 @@ for p in range(P):
 amp = np.abs(img).reshape(n, n)
 db = 20 * np.log10(np.maximum(amp, 1e-30) / np.median(amp))
 
-# 5. draw the image and the boxes (from their lat/lon corners)
-fig, ax = plt.subplots(figsize=(8, 8.4))
+# 5. draw the image, the original boxes (orange, dashed) and the boxes moved for height (green; yellow = ignored)
+fig, ax = plt.subplots(figsize=(8, 8.6))
 ax.imshow(db, cmap="gray", vmin=DB_RANGE[0], vmax=DB_RANGE[1], extent=[0, size_m, size_m, 0])
+moved = []
 for b in meta.get("boxes", []):
     lo0, la0, lo1, la1 = b["bbox_geo"]
     x0, x1 = (lo0 - lon_w) * m_lon, (lo1 - lon_w) * m_lon
     y0, y1 = (lat_n - la1) * m_lat, (lat_n - la0) * m_lat
+    ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="orange", linewidth=1, linestyle="--"))
     colour = "yellow" if b.get("ignore") else "lime"
-    ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor=colour, linewidth=1.5))
-    ax.text(x0, y0 - 3, f"{b.get('ann_id')}  {b.get('visible', 1):.0%}", color=colour, fontsize=8)
+    ax.add_patch(Rectangle((x0 + dE, y0 - dN), x1 - x0, y1 - y0, fill=False, edgecolor=colour, linewidth=1.5))
+    ax.text(x0 + dE, y0 - dN - 3, f"{b.get('ann_id')}  {b.get('visible', 1):.0%}", color=colour, fontsize=8)
+    moved.append(dict(ann_id=b.get("ann_id"), ignore=b.get("ignore", False), bbox_geo_original=b["bbox_geo"],
+                      bbox_geo_moved=[lo0 + dE / m_lon, la0 + dN / m_lat, lo1 + dE / m_lon, la1 + dN / m_lat]))
 ax.set_xlim(0, size_m); ax.set_ylim(size_m, 0)
 ax.set_xlabel("metres east"); ax.set_ylabel("metres south")
-ax.set_title(f"{meta['crop_id']}   plane h = {h:.1f} m\n{meta['label']}: {meta['n_pos']} ship(s), {meta['n_ignore']} ignored "
-             f"(green = ship, yellow = ignored); radar at az {radar_az:.0f} deg, graze {graze:.0f} deg", fontsize=9)
+ax.set_title(f"{meta['crop_id']}   image plane h = {h:.1f} m (water {h_water:.1f}, labels {h_gec:.1f}, crop {h_ref:.1f})\n"
+             f"orange dashed = boxes as labelled, green = moved {move_m:+.1f} m towards the radar "
+             f"(az {radar_az:.0f} deg, graze {graze:.0f} deg)", fontsize=9)
+if OUT_JSON:
+    with open(OUT_JSON, "w") as fh:
+        json.dump(dict(crop_id=meta["crop_id"], h_water=h_water, geoid_n=N_geoid, h_gec=h_gec, h_ref=h_ref, image_h=h,
+                       graze_deg=graze, radar_az_deg=radar_az, move_towards_radar_m=move_m, east_m=dE, north_m=dN,
+                       boxes=moved), fh, indent=1)
+    print("saved", OUT_JSON)
 fig.tight_layout()
 fig.savefig(OUT_PNG, dpi=130)
 print("saved", OUT_PNG)
