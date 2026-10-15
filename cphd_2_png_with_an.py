@@ -12,10 +12,19 @@ What it does, step by step:
      band 1 = amplitude, band 2 = dB, EPSG:4326, so it overlays the GEC in QGIS.
 
 Meant for chips and training crops (up to a few thousand pixels a side); a full scene would take hours this way.
-Needs: pip install numpy sarkit matplotlib rasterio   (without rasterio the .tif is written with a .tfw world file)
+Needs: numpy sarkit matplotlib rasterio pyproj   (without rasterio the .tif is written with a .tfw world file)
 """
 import json, math, os
 import numpy as np
+if int(np.__version__.split(".")[0]) < 2:              # sarkit needs np.asarray(copy=...): add it on numpy 1.x
+    _np_asarray = np.asarray
+
+    def _asarray_compat(a, dtype=None, order=None, *, copy=None, **kw):
+        if copy:
+            return np.array(a, dtype=dtype, order=order, copy=True, **kw)
+        return _np_asarray(a, dtype=dtype, order=order, **kw)
+
+    np.asarray = _asarray_compat
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -28,7 +37,12 @@ JSON_PATH = None           # optional: the chip/crop .json, to draw its boxes an
 OUT_BASE = r"/home/tabtahi/SATLOCK/dataset/chips/chip1_image"   # writes OUT_BASE.png and OUT_BASE.tif
 PIXEL_M = 1.0              # output pixel size, metres
 SIZE_M = None              # side of the square image, metres; None = from the JSON or the CPHD image area
-H = None                   # image plane, ellipsoid height in metres; None = the JSON h_ref, else the CPHD SRP height
+H = "sea"                  # image plane height (ellipsoid metres above WGS-84):
+                           #   "sea"  = mean sea level at the chip: EGM2008 geoid height N(lat, lon) + SEA_OFFSET_M
+                           #   None   = the JSON h_ref, else the CPHD reference-point height (as before)
+                           #   or a number in metres
+SEA_OFFSET_M = 0.0         # water surface above mean sea level (tide; a lake's elevation, e.g. ~174 for Lake Erie)
+GEOID_N = None             # geoid height N in metres if you know it (no lookup); None = look it up with pyproj
 DB_RANGE = (-5, 35)        # PNG display range, dB above the median
 # ------------------------------------------------------------------
 
@@ -54,6 +68,41 @@ def ecef_to_llh(x, y, z):
     return math.degrees(lat), math.degrees(lon), h
 
 
+def geoid_height(lat, lon):
+    """EGM2008 geoid height N above the WGS-84 ellipsoid at (lat, lon), metres (EGM96 as a fallback), with pyproj.
+
+    PROJ needs the geoid grid file (us_nga_egm08_25.tif, ~80 MB, or us_nga_egm96_15.tif). If it is not on this
+    computer yet, it is downloaded once into the PROJ user folder (pyproj.datadir.get_user_data_dir()), then reused.
+    Without the grid PROJ silently returns height 0, so that case is treated as a failure, not as N = 0."""
+    import pyproj
+    from pyproj import Transformer
+    from pyproj.transformer import TransformerGroup
+    pyproj.network.set_network_enabled(True)
+    problems = []
+    for code, name in (("3855", "EGM2008"), ("5773", "EGM96")):
+        target = f"EPSG:4326+{code}"
+        try:
+            group = TransformerGroup("EPSG:4979", target, always_xy=True)
+            if not group.best_available:                  # grid missing: fetch it once (needs internet)
+                print(f"  downloading the {name} geoid grid into {pyproj.datadir.get_user_data_dir()} ...")
+                group.download_grids(verbose=True)
+            for attempt in range(2):
+                t = Transformer.from_crs("EPSG:4979", target, always_xy=True, only_best=True)
+                _, _, h_orth = t.transform(lon, lat, 0.0)  # height above the geoid of a point on the ellipsoid = -N
+                if np.isfinite(h_orth) and abs(h_orth) > 1e-6:
+                    return -float(h_orth), name
+                if attempt == 0:                           # not applied: make sure the grid is on disk, then retry
+                    print(f"  fetching the {name} geoid grid into {pyproj.datadir.get_user_data_dir()} ...")
+                    group.download_grids(verbose=True)
+            problems.append(f"{name}: grid not applied (got {h_orth})")
+        except Exception as e:
+            problems.append(f"{name}: {type(e).__name__}: {e}")
+    raise SystemExit("could not get the geoid height with pyproj " + pyproj.__version__ + ":\n  " + "\n  ".join(problems)
+                     + "\nIf this computer has no internet, copy us_nga_egm08_25.tif from cdn.proj.org into "
+                     + pyproj.datadir.get_user_data_dir() + ", or set GEOID_N by hand "
+                     "(https://geographiclib.sourceforge.io/cgi-bin/GeoidEval)")
+
+
 def metres_per_degree(lat):
     s = math.sin(math.radians(lat))
     return (math.pi / 180 * A * (1 - E2) / (1 - E2 * s * s) ** 1.5,
@@ -76,7 +125,12 @@ srp = np.asarray(pv["SRPPos"][P // 2], float)           # reference point = chip
 meta = json.load(open(JSON_PATH)) if JSON_PATH else {}
 lat0, lon0, h_srp = ecef_to_llh(*srp)
 lat0, lon0 = meta.get("centre_lat", lat0), meta.get("centre_lon", lon0)
-h = float(H) if H is not None else float(meta.get("h_ref", h_srp))
+if isinstance(H, str) and H.lower() == "sea":
+    N_geoid, src = (float(GEOID_N), "typed in") if GEOID_N is not None else geoid_height(lat0, lon0)
+    h = N_geoid + SEA_OFFSET_M
+    print(f"sea level here: geoid N = {N_geoid:.2f} m ({src}) + {SEA_OFFSET_M:.2f} m -> plane {h:.2f} m above the ellipsoid")
+else:
+    h = float(H) if H is not None else float(meta.get("h_ref", h_srp))
 if SIZE_M is not None:
     size_m = float(SIZE_M)
 elif "grid" in meta:
