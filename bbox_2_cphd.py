@@ -37,6 +37,17 @@ MEM_GB = 8.0
 # pieces of build_crops.py this needs: reader, scene geometry, crop planning, fast-time gating, slow-time resampling,
 # CPHD writer). Runs on Windows, macOS and Linux; GPU (CuPy) is optional.
 import copy
+if int(np.__version__.split(".")[0]) < 2:
+    # sarkit calls np.asarray(..., copy=False), which numpy 1.x does not accept. Teach numpy 1.x that keyword so this
+    # runs without upgrading numpy (copy=False / None = no forced copy, copy=True = copy).
+    _np_asarray = np.asarray
+
+    def _asarray_compat(a, dtype=None, order=None, *, copy=None, **kw):
+        if copy:
+            return np.array(a, dtype=dtype, order=order, copy=True, **kw)
+        return _np_asarray(a, dtype=dtype, order=order, **kw)
+
+    np.asarray = _asarray_compat
 import scipy.fft as sp_fft
 from scipy.signal import firwin, upfirdn
 import sarkit.cphd as skcphd
@@ -512,16 +523,32 @@ def random_box(a, tries=30):
     cfg = dict(DEFAULTS, core_m=side, pixel_m=a.gsd, res_az=a.gsd, res_rg=a.gsd, margin=a.margin, h_ref=a.h_ref,
                pulses=64, samples=64)
     sc = Scene(c, cfg)
+    info = sc.summary()
+    print(f"scene footprint ({how}): lon {W:.5f}..{E_:.5f}, lat {S:.5f}..{N_:.5f} "
+          f"({(E_ - W) * mo:.0f} x {(N_ - S) * ml:.0f} m); dwell {info['aperture_full_deg']:.3f} deg, "
+          f"a {a.gsd} m chip needs {info['aperture_crop_deg']:.3f} deg")
+    reasons = {}
     for i in range(tries):
         lat, lon = rng.uniform(la_a, la_b), rng.uniform(lo_a, lo_b)
         p, why = sc.plan(lat, lon)
         if p is not None:
             dl, do = 0.5 * side / ml, 0.5 * side / mo
             box = [lon - do, lat - dl, lon + do, lat + dl]
-            print(f"random {side:.0f} m box (footprint from the {how}, try {i + 1}): "
+            print(f"random {side:.0f} m box (try {i + 1}): "
                   f"--bbox {box[0]:.6f} {box[1]:.6f} {box[2]:.6f} {box[3]:.6f}")
             return box
-    raise SystemExit(f"no chippable random box found in {tries} tries (last reason: {why})")
+        reasons[why.split(":")[0]] = why
+    print(f"no chippable random box in {tries} tries. Reasons seen:")
+    for k, v in reasons.items():
+        print(f"  {v}")
+    hint = {"aperture": "the pass does not sweep enough look angle for this GSD: raise GSD_M (or the input is already "
+                        "a chip / crop at this GSD: use the full scene CPHD)",
+            "swath": "the box reaches outside the range swath the CPHD stores: use a smaller RANDOM_BOX_M",
+            "PRF too low": "the box is too big for the pulse rate at this GSD: use a smaller RANDOM_BOX_M or a larger GSD_M"}
+    for k in reasons:
+        if k in hint:
+            print(f"  -> {hint[k]}")
+    raise SystemExit(1)
 
 
 def main():
@@ -577,8 +604,21 @@ def main():
 
     with open(a.cphd, "rb") as f, skcphd.Reader(f) as r:
         meta = dict(tree=copy.deepcopy(r.metadata.xmltree))
-        meta["support"] = {s.findtext("{*}Identifier"): r.read_support_array(s.findtext("{*}Identifier"))
-                           for s in meta["tree"].findall("{*}Data/{*}SupportArray")}
+        try:
+            meta["support"] = {s.findtext("{*}Identifier"): r.read_support_array(s.findtext("{*}Identifier"))
+                               for s in meta["tree"].findall("{*}Data/{*}SupportArray")}
+        except TypeError as e:
+            # sarkit 1.12 needs numpy >= 2 to read support arrays (np.asarray(copy=...)); with numpy 1.x, drop them.
+            # They are not needed for imaging or for these tools; `pip install -U "numpy>=2"` keeps them.
+            print(f"  note: cannot read the CPHD support arrays with numpy {np.__version__} ({e}); "
+                  f"writing the chip without them (pip install -U \"numpy>=2\" to keep them)")
+            root = meta["tree"].getroot()
+            for node in root.findall("{*}Data/{*}SupportArray") + root.findall("{*}SupportArray"):
+                node.getparent().remove(node)
+            n_sa = root.find("{*}Data/{*}NumSupportArrays")
+            if n_sa is not None:
+                n_sa.text = "0"
+            meta["support"] = {}
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     write_crop(sc, meta, p, Z, a.out, [lon_min, lat_min, lon_max, lat_max])
     js = os.path.splitext(a.out)[0] + ".json"
