@@ -1,107 +1,163 @@
-#!/usr/bin/env python3
-"""Cut a CPHD chip for a lat/lon box at a chosen ground resolution.
+"""Form an image from a CPHD crop or chip and save it as a PNG (to look at) and a GeoTIFF (to open in QGIS).
 
-Set the inputs in the block below and run:  python chip_cphd.py
-(Command-line flags still work and override the block, e.g. --bbox LON_MIN LAT_MIN LON_MAX LAT_MAX --gsd 2.)
+Set the paths below and run:  python cphd_to_image.py
 
-The chip is a valid CPHD whose reference point is the box centre: pulses re-referenced to that point, range gated to
-the box (plus --margin), band cut for --gsd ground-range resolution, Doppler low-passed and resampled to pulses
-uniform in look angle spanning lambda / (2 gsd). It is the same processing as build_crops.py (which it imports), for
-one box of any size instead of the fixed 512 m training crops. A JSON with the geometry is written beside it
-(it also works as the JSON for crop_to_png.py, to look at the chip).
+What it does, step by step:
+  1. reads the phase history (pulses x frequencies, complex) and every pulse's antenna position;
+  2. lays a north-up lat/lon grid over the chip at PIXEL_M spacing, on a flat surface at height H (ellipsoid);
+  3. range compression: inverse FFT along frequency turns each pulse into echo strength versus distance;
+  4. backprojection: for every pixel and every pulse, read the echo at that pixel's distance from the antenna and
+     add them all up (with the phase that distance implies). Bright pixels = where echoes add up = scatterers.
+  5. saves |image| in dB as a PNG (with label boxes if a JSON is given) and as a GeoTIFF:
+     band 1 = amplitude, band 2 = dB, EPSG:4326, so it overlays the GEC in QGIS.
 
-Pulses / samples are chosen from the box size: (box side x (1 + margin) / gsd) x --oversample, rounded up to a multiple
-of 64, unless --pulses / --samples are given. The box is processed as a square of its longer side.
-Run where build_crops.py is (e.g. inside the cphd-gpu image: /app/chip_cphd.py).
+Meant for chips and training crops (up to a few thousand pixels a side); a full scene would take hours this way.
+Needs: pip install numpy sarkit matplotlib rasterio   (without rasterio the .tif is written with a .tfw world file)
 """
-import argparse, json, math, os, sys, time
+import json, math, os
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import sarkit.cphd as skcphd
 
 # ------------------------------------------------------------------ set these
-CPHD_PATH = r"/home/tabtahi/SATLOCK/dataset/cphd/2023-08-25-15-09-21_UMBRA-06/2023-08-25-15-09-21_UMBRA-06_CPHD.cphd"
-BBOX = [-81.7050, 41.5010, -81.7000, 41.5040]   # lon_min, lat_min, lon_max, lat_max (degrees)
-GSD_M = 1.0              # ground resolution, metres (range and cross-range)
-OUT_PATH = r"/home/tabtahi/SATLOCK/dataset/chips/chip1.cphd"   # a .json is written next to it
-MARGIN = 0.25            # extra extent around the box, fraction of its side
-OVERSAMPLE = 1.6         # samples per resolution cell across the extent
-PULSES = 0               # output pulses; 0 = from the box size
-SAMPLES = 0              # output frequency samples; 0 = from the box size
-H_REF = None             # ellipsoid height of the chip plane, metres; None = the CPHD reference height
-DEVICE = "cpu"           # "cpu" or "gpu"
-MEM_GB = 8.0
+CPHD_PATH = r"/home/tabtahi/SATLOCK/dataset/chips/chip1.cphd"
+JSON_PATH = None           # optional: the chip/crop .json, to draw its boxes and use its centre/size/h_ref
+OUT_BASE = r"/home/tabtahi/SATLOCK/dataset/chips/chip1_image"   # writes OUT_BASE.png and OUT_BASE.tif
+PIXEL_M = 1.0              # output pixel size, metres
+SIZE_M = None              # side of the square image, metres; None = from the JSON or the CPHD image area
+H = None                   # image plane, ellipsoid height in metres; None = the JSON h_ref, else the CPHD SRP height
+DB_RANGE = (-5, 35)        # PNG display range, dB above the median
 # ------------------------------------------------------------------
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import build_crops as bc
+C = 299792458.0
+A, E2 = 6378137.0, 6.69437999014e-3                     # WGS-84
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cphd", default=CPHD_PATH, help="full scene CPHD (FX domain, uncompressed)")
-    ap.add_argument("--bbox", default=BBOX, type=float, nargs=4, metavar=("LON_MIN", "LAT_MIN", "LON_MAX", "LAT_MAX"))
-    ap.add_argument("--gsd", type=float, default=GSD_M, help="ground resolution in metres, both range and cross-range")
-    ap.add_argument("--out", default=OUT_PATH, help="output chip .cphd (a .json is written next to it)")
-    ap.add_argument("--margin", type=float, default=MARGIN, help="extra extent around the box, fraction of its side")
-    ap.add_argument("--oversample", type=float, default=OVERSAMPLE, help="samples per resolution cell across the extent")
-    ap.add_argument("--pulses", type=int, default=PULSES, help="output pulses (0 = from box size)")
-    ap.add_argument("--samples", type=int, default=SAMPLES, help="output frequency samples (0 = from box size)")
-    ap.add_argument("--h-ref", type=float, default=H_REF, help="ellipsoid height of the chip plane (default: CPHD reference)")
-    ap.add_argument("--device", choices=["cpu", "gpu"], default=DEVICE)
-    ap.add_argument("--mem-gb", type=float, default=MEM_GB)
-    a = ap.parse_args()
-
-    lo0, la0, lo1, la1 = a.bbox
-    lon_min, lon_max, lat_min, lat_max = min(lo0, lo1), max(lo0, lo1), min(la0, la1), max(la0, la1)
-    lat, lon = 0.5 * (lat_min + lat_max), 0.5 * (lon_min + lon_max)
-    ml, mo = bc.m_per_deg(lat)
-    w_m, h_m = (lon_max - lon_min) * mo, (lat_max - lat_min) * ml
-    side = max(w_m, h_m, 16 * a.gsd)
-    n_auto = int(math.ceil(side * (1 + a.margin) / a.gsd * a.oversample / 64) * 64)
-    cfg = dict(bc.DEFAULTS, core_m=side, pixel_m=a.gsd, res_az=a.gsd, res_rg=a.gsd, margin=a.margin,
-               pulses=a.pulses or n_auto, samples=a.samples or n_auto, h_ref=a.h_ref, device=a.device, mem_gb=a.mem_gb)
-    t0 = time.time()
-    c = bc.CPHD(a.cphd)
-    sc = bc.Scene(c, cfg)
-    info = sc.summary()
-    print(f"box {w_m:.0f} x {h_m:.0f} m at {lat:.6f}, {lon:.6f}; processed as {side * (1 + a.margin):.0f} m square")
-    print(f"scene: graze {info['graze_deg']:.1f} deg, dwell {info['aperture_full_deg']:.2f} deg; chip needs aperture "
-          f"{info['aperture_crop_deg']:.2f} deg, band {info['band_mhz']:.0f} MHz -> range resolution {info['res_rg_m']:.2f} m")
-    if info["res_rg_m"] > a.gsd * 1.01:
-        print(f"  note: the CPHD band only allows {info['res_rg_m']:.2f} m in range")
-    p, why = sc.plan(lat, lon)
-    if p is None:
-        max_res = sc.lam / (2 * math.radians(info["aperture_full_deg"]))
-        sys.exit(f"cannot cut this chip: {why}" + (f" (finest cross-range here is about {max_res:.2f} m: raise --gsd)"
-                                                      if why.startswith("aperture") else ""))
-    if not p["alias_free"]:
-        print("  warning: Doppler band wide for the pulse count; raise --pulses or --oversample")
-    print(f"output {sc.P} pulses x {sc.S} samples ({sc.P * sc.S * 8 / 1e6:.0f} MB); reading pulses "
-          f"{p['n0']:,}..{p['n1']:,} of {c.nv:,}")
-
-    xp = bc.get_xp(cfg)
-    buf = bc.extract_group(sc, {"chip": p}, workers=cfg["workers"], chunk=cfg["chunk"] if xp is np else 1024, xp=xp)
-    Z = bc.resample_slow_time(sc, p, buf.pop("chip"), xp, cfg["resample"])
-
-    import copy, sarkit.cphd as skcphd
-    with open(a.cphd, "rb") as f, skcphd.Reader(f) as r:
-        meta = dict(tree=copy.deepcopy(r.metadata.xmltree))
-        meta["support"] = {s.findtext("{*}Identifier"): r.read_support_array(s.findtext("{*}Identifier"))
-                           for s in meta["tree"].findall("{*}Data/{*}SupportArray")}
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    bc.write_crop(sc, meta, p, Z, a.out, [lon_min, lat_min, lon_max, lat_max])
-    js = os.path.splitext(a.out)[0] + ".json"
-    with open(js, "w") as f:
-        json.dump(dict(source_cphd=os.path.abspath(a.cphd), bbox_geo=[lon_min, lat_min, lon_max, lat_max],
-                       centre_lat=lat, centre_lon=lon, h_ref=sc.h_ref, box_m=[round(w_m, 2), round(h_m, 2)],
-                       extent_geo=p["ext_bounds"], gsd_m=a.gsd, res_rg_m=sc.res_rg, res_az_m=a.gsd,
-                       pulses=sc.P, samples=sc.S, aperture_deg=math.degrees(sc.dtheta), band_hz=sc.B_t,
-                       graze_deg=info["graze_deg"], sgn=c.sgn, alias_free=p["alias_free"],
-                       # fields crop_to_png.py reads, so the chip can be viewed with it
-                       crop_id=os.path.splitext(os.path.basename(a.out))[0],
-                       grid=dict(n=int(round(side / a.gsd)), pixel_m=a.gsd), label="chip", n_pos=0, n_ignore=0,
-                       boxes=[]), f, indent=1)
-    print(f"wrote {a.out} and {js} in {time.time() - t0:.0f} s")
+def llh_to_ecef(lat, lon, h):
+    la, lo = np.radians(lat), np.radians(lon)
+    n = A / np.sqrt(1 - E2 * np.sin(la) ** 2)
+    return np.stack([(n + h) * np.cos(la) * np.cos(lo), (n + h) * np.cos(la) * np.sin(lo),
+                     (n * (1 - E2) + h) * np.sin(la)], -1)
 
 
-if __name__ == "__main__":
-    main()
+def ecef_to_llh(x, y, z):
+    lon = math.atan2(y, x)
+    p = math.hypot(x, y)
+    lat = math.atan2(z, p * (1 - E2))
+    for _ in range(10):                                  # fixed-point iteration, converges to mm in a few steps
+        n = A / math.sqrt(1 - E2 * math.sin(lat) ** 2)
+        h = p / math.cos(lat) - n
+        lat = math.atan2(z, p * (1 - E2 * n / (n + h)))
+    return math.degrees(lat), math.degrees(lon), h
+
+
+def metres_per_degree(lat):
+    s = math.sin(math.radians(lat))
+    return (math.pi / 180 * A * (1 - E2) / (1 - E2 * s * s) ** 1.5,
+            math.pi / 180 * A / math.sqrt(1 - E2 * s * s) * math.cos(math.radians(lat)))
+
+
+# 1. read the phase history and geometry
+with open(CPHD_PATH, "rb") as f, skcphd.Reader(f) as r:
+    xml = r.metadata.xmltree
+    ch = xml.find("{*}Data/{*}Channel").findtext("{*}Identifier")
+    sgn = int(xml.findtext("{*}Global/{*}SGN"))
+    pv = r.read_pvps(ch)
+    sig = r.read_signal(ch)
+    ia = xml.find("{*}SceneCoordinates/{*}ImageArea")
+X = (sig["real"] + 1j * sig["imag"]) if sig.dtype.names else sig.astype(np.complex128)
+if "AmpSF" in pv.dtype.names:
+    X = X * np.nan_to_num(np.asarray(pv["AmpSF"], float))[:, None]
+P, S = X.shape
+srp = np.asarray(pv["SRPPos"][P // 2], float)           # reference point = chip centre (for our chips and crops)
+meta = json.load(open(JSON_PATH)) if JSON_PATH else {}
+lat0, lon0, h_srp = ecef_to_llh(*srp)
+lat0, lon0 = meta.get("centre_lat", lat0), meta.get("centre_lon", lon0)
+h = float(H) if H is not None else float(meta.get("h_ref", h_srp))
+if SIZE_M is not None:
+    size_m = float(SIZE_M)
+elif "grid" in meta:
+    size_m = meta["grid"]["n"] * meta["grid"]["pixel_m"]
+elif ia is not None and ia.find("{*}X1Y1") is not None:
+    size_m = 2 * float(ia.findtext("{*}X2Y2/{*}X"))
+else:
+    size_m = 512.0
+tx = np.asarray(pv["TxPos"], float) - srp
+rc = np.asarray(pv["RcvPos"], float) - srp
+f0 = np.asarray(pv["SC0"], float)
+scss = float(pv["SCSS"][P // 2])
+print(f"{os.path.basename(CPHD_PATH)}: {P} pulses x {S} samples, centre {lat0:.6f}, {lon0:.6f}, "
+      f"plane {h:.2f} m (SRP {h_srp:.2f} m), image {size_m:.0f} m at {PIXEL_M} m")
+
+# 2. north-up lat/lon pixel grid on the plane at height h, positions relative to the chip centre
+n = int(round(size_m / PIXEL_M))
+m_lat, m_lon = metres_per_degree(lat0)
+dlat, dlon = PIXEL_M / m_lat, PIXEL_M / m_lon
+lat_n, lon_w = lat0 + n * dlat / 2, lon0 - n * dlon / 2
+LON, LAT = np.meshgrid(lon_w + (np.arange(n) + 0.5) * dlon, lat_n - (np.arange(n) + 0.5) * dlat)
+pix = llh_to_ecef(LAT, LON, np.full(LAT.shape, h)).reshape(-1, 3) - srp
+pp = (pix ** 2).sum(1)
+
+# 3. range compression: one sign convention, taper, inverse FFT along frequency (4x oversampled)
+if sgn > 0:
+    X = np.conj(X)
+X = X * np.hanning(P)[:, None] * np.hanning(S)[None, :]
+K = 4 * S
+prof = np.fft.fftshift(np.fft.ifft(X, n=K, axis=1), axes=1)
+
+
+def delay_diff(t):
+    """two-way path to each pixel minus path to the chip centre, for antenna position t (stable form)"""
+    num = pp - 2 * (pix @ t)
+    return num / (np.sqrt(t @ t + num) + np.sqrt(t @ t))
+
+
+# 4. backprojection
+img = np.zeros(len(pix), complex)
+for p in range(P):
+    dtau = (delay_diff(tx[p]) + delay_diff(rc[p])) / C
+    k = dtau * K * scss + K // 2
+    k0 = np.clip(np.floor(k).astype(int), 0, K - 2)
+    w = k - k0
+    val = prof[p, k0] * (1 - w) + prof[p, k0 + 1] * w
+    img += np.where((k >= 0) & (k < K - 1), val * np.exp(2j * np.pi * f0[p] * dtau), 0)
+    if p % 128 == 0:
+        print(f"  pulse {p} of {P}")
+amp = np.abs(img).reshape(n, n).astype(np.float32)
+db = (20 * np.log10(np.maximum(amp, 1e-30) / np.median(amp))).astype(np.float32)
+
+# 5a. PNG
+fig, ax = plt.subplots(figsize=(8, 8.4))
+ax.imshow(db, cmap="gray", vmin=DB_RANGE[0], vmax=DB_RANGE[1], extent=[0, size_m, size_m, 0])
+for b in meta.get("boxes", []):
+    lo0, la0, lo1, la1 = b["bbox_geo"]
+    x0, x1 = (lo0 - lon_w) * m_lon, (lo1 - lon_w) * m_lon
+    y0, y1 = (lat_n - la1) * m_lat, (lat_n - la0) * m_lat
+    ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor="yellow" if b.get("ignore") else "lime"))
+ax.set_xlabel("metres east"); ax.set_ylabel("metres south")
+ax.set_title(f"{os.path.basename(CPHD_PATH)}  centre {lat0:.5f}, {lon0:.5f}  plane {h:.1f} m  ({PIXEL_M} m pixels)", fontsize=9)
+fig.tight_layout()
+fig.savefig(OUT_BASE + ".png", dpi=130)
+print("saved", OUT_BASE + ".png")
+
+# 5b. GeoTIFF: band 1 amplitude, band 2 dB, north-up EPSG:4326 (pixel corners: lon_w, lat_n)
+try:
+    import rasterio
+    from rasterio.transform import from_origin
+    with rasterio.open(OUT_BASE + ".tif", "w", driver="GTiff", width=n, height=n, count=2, dtype="float32",
+                       crs="EPSG:4326", transform=from_origin(lon_w, lat_n, dlon, dlat)) as dst:
+        dst.write(amp, 1)
+        dst.write(db, 2)
+        dst.set_band_description(1, "amplitude")
+        dst.set_band_description(2, "dB above median")
+        dst.update_tags(SOURCE_CPHD=os.path.basename(CPHD_PATH), PLANE_HEIGHT_HAE_M=f"{h:.3f}", PIXEL_M=str(PIXEL_M))
+    print("saved", OUT_BASE + ".tif (GeoTIFF, EPSG:4326)")
+except ImportError:
+    import tifffile
+    tifffile.imwrite(OUT_BASE + ".tif", np.stack([amp, db]))
+    with open(OUT_BASE + ".tfw", "w") as fh:                  # world file: pixel size and centre of the top-left pixel
+        fh.write(f"{dlon}\n0\n0\n{-dlat}\n{lon_w + dlon / 2}\n{lat_n - dlat / 2}\n")
+    print("saved", OUT_BASE + ".tif with a .tfw world file (rasterio not installed; set the layer CRS to EPSG:4326)")
