@@ -1,29 +1,28 @@
-"""Small GUI: drag label boxes onto the ships in our CPHD image, and get the height that explains the shift.
+"""Drag the label boxes onto the ships, read off the shift and the height it implies, and save a corrected JSON.
 
-Set the paths below and run:  python height_from_clicks.py
-(In Spyder, first run  %matplotlib qt  in the console so the window is interactive.)
+All boxes move together (one translation for the whole image), so you only need to drag ONE box onto its ship;
+drag again to fine-tune (any box). Then press  s  to save.
 
-How to use
-  1. LEFT-click inside a box (green) to pick it - it turns red.
-  2. LEFT-click on the ship's true centre in the image - the box moves there (cyan) and an arrow shows the shift.
-  3. Repeat for a few ships (3-10 spread over the image is plenty).  RIGHT-click = un-pick,  u = undo last move,
-     s = save the moves and the result to OUT_JSON.  Use the toolbar zoom/pan freely (clicks are ignored while a
-     toolbar tool is active).
+Set the paths below and run:  python box_shift_gui.py      (in Spyder first run  %matplotlib qt  in the console)
 
-What it computes (all heights are ellipsoid heights, metres above WGS-84)
-  A ship at height h_true, imaged on a plane at height h_plane, appears (h_true - h_plane) x tan(graze) TOWARDS the
-  radar from its true position. So for each moved box:
-      shift along the radar direction  d  ->  height offset  dh = d / tan(graze),   h_true = h_plane + dh
-      shift across it                       -> NOT a height effect (labels, timing, moving ship, ...)
-  It prints the mean and spread over your moves, then compares h_true with the heights found in the data
-  (the image plane used, the CPHD reference point / IARP heights, the sea surface = geoid N if pyproj can get it,
-  and the GEC HEIGHT_OFF if you give the GEC). A good match tells you which height to image at.
+  drag a box (left mouse)   move ALL boxes by the same amount; orange dashed = original, green = moved
+  r                         reset to the original positions
+  s                         save the corrected JSON (+ print the metrics and the heights found in the data)
+  toolbar zoom / pan        work as usual (dragging is off while a toolbar tool is active)
 
-Inputs: the GeoTIFF from cphd_to_image.py (it carries the plane height, graze and radar direction), and a JSON with
-boxes: a crop/chip .json ("boxes"), or an annotations.json ("annotations"), each with bbox_geo
-[lon_min, lat_min, lon_max, lat_max].
+Metrics (all heights are ellipsoid heights, metres above WGS-84):
+  translation      east / north in metres, and in degrees (lon / lat)
+  along the radar  part of the shift towards (+) / away from (-) the radar  -> height offset = along / tan(graze):
+                   ships sit at  h_plane + offset  (h_plane = height the image was formed at)
+  across           part of the shift that height cannot explain (label alignment, timing, moving ships ...)
+The saved JSON is the input JSON with every bbox_geo moved by the translation (the original kept as
+bbox_geo_original), plus a "box_translation" record with all the numbers.
+
+Inputs: the GeoTIFF from cphd_to_image.py (it stores the plane height, graze and radar direction) and the JSON with
+boxes (annotations.json "annotations", or a crop / chip .json "boxes"; each with bbox_geo
+[lon_min, lat_min, lon_max, lat_max]).
 """
-import json, math, os
+import copy, json, math
 import numpy as np
 if int(np.__version__.split(".")[0]) < 2:              # sarkit needs np.asarray(copy=...): add it on numpy 1.x
     _np_asarray = np.asarray
@@ -34,16 +33,15 @@ if int(np.__version__.split(".")[0]) < 2:              # sarkit needs np.asarray
         return _np_asarray(a, dtype=dtype, order=order, **kw)
 
     np.asarray = _asarray_compat
-import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, FancyArrowPatch
+from matplotlib.patches import Rectangle
 
 # ------------------------------------------------------------------ set these
-TIF_PATH = r"C:\data\chip1_image.tif"          # from cphd_to_image.py
-BOXES_JSON = r"C:\data\annotations.json"       # crop/chip .json or annotations.json with bbox_geo boxes
-CPHD_PATH = None                               # optional: the CPHD, to compare with its reference heights
-GEC_PATH = None                                # optional: the GEC .tif, to compare with its RPC HEIGHT_OFF
-OUT_JSON = r"C:\data\height_from_clicks.json"  # where 's' saves the result
+TIF_PATH = r"C:\data\chip1_image.tif"            # from cphd_to_image.py
+BOXES_JSON = r"C:\data\annotations.json"         # annotations.json or a crop / chip .json
+OUT_JSON = r"C:\data\annotations_shifted.json"   # corrected boxes are written here
+CPHD_PATH = None                                 # optional: compare with the CPHD's reference heights
+GEC_PATH = None                                  # optional: compare with the GEC's RPC HEIGHT_OFF
 DB_RANGE = (-5, 35)
 # ------------------------------------------------------------------
 
@@ -56,47 +54,45 @@ def m_per_deg(lat):
             math.pi / 180 * A / math.sqrt(1 - E2 * s * s) * math.cos(math.radians(lat)))
 
 
-def height_from_moves(moves, graze_deg, radar_az_deg, h_plane):
-    """moves: list of (dE, dN) in metres, from the labelled box centre to where the ship is in the image."""
+def shift_metrics(dE, dN, graze_deg, radar_az_deg, h_plane, lat):
     az = math.radians(radar_az_deg)
-    towards = np.array([math.sin(az), math.cos(az)])          # ground direction towards the radar (east, north)
-    across_dir = np.array([-towards[1], towards[0]])
-    d = np.array(moves, float).reshape(-1, 2)
-    along, across = d @ towards, d @ across_dir
+    tE, tN = math.sin(az), math.cos(az)                        # ground direction towards the radar
+    along = dE * tE + dN * tN
+    across = -dE * tN + dN * tE
     dh = along / math.tan(math.radians(graze_deg))
-    return dict(n=len(d), along_m=along, across_m=across, dh=dh, h_true=h_plane + dh,
-                dh_mean=float(dh.mean()) if len(d) else float("nan"), dh_std=float(dh.std()) if len(d) > 1 else 0.0,
-                across_mean=float(across.mean()) if len(d) else float("nan"))
+    ml, mo = m_per_deg(lat)
+    return dict(east_m=dE, north_m=dN, dlon_deg=dE / mo, dlat_deg=dN / ml, total_m=math.hypot(dE, dN),
+                along_radar_m=along, across_m=across, height_offset_m=dh, h_plane=h_plane, h_ships=h_plane + dh,
+                graze_deg=graze_deg, radar_az_deg=radar_az_deg)
 
 
-def data_heights(cphd_path, gec_path, lat, lon, h_plane):
-    """Heights found in the data, to compare with the clicked estimate."""
+def data_heights(lat, lon, h_plane):
     out = {"image plane used": h_plane}
-    if cphd_path:
+    if CPHD_PATH:
         try:
             import sarkit.cphd as skcphd
-            with open(cphd_path, "rb") as f, skcphd.Reader(f) as r:
+            with open(CPHD_PATH, "rb") as f, skcphd.Reader(f) as r:
                 x = r.metadata.xmltree
                 hae = x.findtext("{*}SceneCoordinates/{*}IARP/{*}LLH/{*}HAE")
                 if hae is not None:
                     out["CPHD IARP HAE"] = float(hae)
-                ch = x.findtext("{*}Data/{*}Channel/{*}Identifier")
-                srp = np.median(np.asarray(r.read_pvps(ch)["SRPPos"], float), 0)
-            p = math.hypot(srp[0], srp[1]); la = math.atan2(srp[2], p * (1 - E2))
+                srp = np.median(np.asarray(r.read_pvps(x.findtext("{*}Data/{*}Channel/{*}Identifier"))["SRPPos"],
+                                           float), 0)
+            p = math.hypot(srp[0], srp[1]); la = math.atan2(srp[2], p * (1 - E2)); hh = 0.0
             for _ in range(10):
                 n = A / math.sqrt(1 - E2 * math.sin(la) ** 2); hh = p / math.cos(la) - n
                 la = math.atan2(srp[2], p * (1 - E2 * n / (n + hh)))
             out["CPHD SRP height (median)"] = hh
         except Exception as e:
-            print(f"  (could not read CPHD heights: {e})")
-    if gec_path:
+            print(f"  (could not read the CPHD heights: {e})")
+    if GEC_PATH:
         try:
             import rasterio
-            with rasterio.open(gec_path) as g:
+            with rasterio.open(GEC_PATH) as g:
                 if g.rpcs is not None:
                     out["GEC RPC HEIGHT_OFF"] = float(g.rpcs.height_off)
         except Exception as e:
-            print(f"  (could not read GEC HEIGHT_OFF: {e})")
+            print(f"  (could not read the GEC HEIGHT_OFF: {e})")
     try:
         import pyproj
         from pyproj import Transformer
@@ -109,12 +105,14 @@ def data_heights(cphd_path, gec_path, lat, lon, h_plane):
     return out
 
 
-def load_boxes(path):
-    d = json.load(open(path))
+def box_items(d):
+    """The list holding the boxes in this JSON (annotations.json or crop/chip json)."""
     if isinstance(d, list):
         d = d[0]
-    items = d.get("boxes") or d.get("annotations") or []
-    return [(b.get("ann_id", b.get("id", i)), b["bbox_geo"]) for i, b in enumerate(items) if b.get("bbox_geo")]
+    for key in ("annotations", "boxes"):
+        if isinstance(d.get(key), list):
+            return d, [b for b in d[key] if b.get("bbox_geo")]
+    return d, []
 
 
 def main():
@@ -125,128 +123,122 @@ def main():
             img = 20 * np.log10(np.maximum(img, 1e-30) / np.median(img))
         tags, T, (H_, W_) = src.tags(), src.transform, src.shape
     h_plane = float(tags.get("PLANE_HEIGHT_HAE_M", "nan"))
-    graze = float(tags.get("GRAZE_DEG", "nan"))
-    az = float(tags.get("RADAR_AZIMUTH_DEG", "nan"))
+    graze, az = float(tags.get("GRAZE_DEG", "nan")), float(tags.get("RADAR_AZIMUTH_DEG", "nan"))
     if not (np.isfinite(graze) and np.isfinite(az)):
-        raise SystemExit("the GeoTIFF has no GRAZE_DEG / RADAR_AZIMUTH_DEG tags: make it with the latest cphd_to_image.py")
+        raise SystemExit("the GeoTIFF has no GRAZE_DEG / RADAR_AZIMUTH_DEG tags: remake it with the latest cphd_to_image.py")
     lon_w, lat_n = T.c, T.f
     lon_c, lat_c = lon_w + T.a * W_ / 2, lat_n + T.e * H_ / 2
     ml, mo = m_per_deg(lat_c)
-    to_e = lambda lon: (lon - lon_c) * mo                     # metres east / north of the image centre
-    to_n = lambda lat: (lat - lat_c) * ml
-    ext = [to_e(lon_w), to_e(lon_w + T.a * W_), to_n(lat_n + T.e * H_), to_n(lat_n)]
+    E = lambda lon: (lon - lon_c) * mo
+    N = lambda lat: (lat - lat_c) * ml
+    ext = [E(lon_w), E(lon_w + T.a * W_), N(lat_n + T.e * H_), N(lat_n)]
 
+    raw = json.load(open(BOXES_JSON))
+    root, items = box_items(raw)
     boxes = []
-    for bid, (lo0, la0, lo1, la1) in load_boxes(BOXES_JSON):
-        e0, e1, n0, n1 = to_e(lo0), to_e(lo1), to_n(la0), to_n(la1)
-        if e1 > ext[0] and e0 < ext[1] and n1 > ext[2] and n0 < ext[3]:
-            boxes.append(dict(id=bid, e0=e0, e1=e1, n0=n0, n1=n1, geo=[lo0, la0, lo1, la1]))
-    print(f"{len(boxes)} boxes inside the image; plane {h_plane:.2f} m, graze {graze:.1f} deg, radar az {az:.0f} deg")
+    for it in items:
+        lo0, la0, lo1, la1 = it["bbox_geo"]
+        boxes.append(dict(e0=E(lo0), e1=E(lo1), n0=N(la0), n1=N(la1)))
+    inside = [i for i, b in enumerate(boxes) if b["e1"] > ext[0] and b["e0"] < ext[1] and b["n1"] > ext[2] and b["n0"] < ext[3]]
+    print(f"{len(items)} boxes in the JSON, {len(inside)} inside the image; plane {h_plane:.2f} m, "
+          f"graze {graze:.1f} deg, radar az {az:.0f} deg")
 
-    fig, ax = plt.subplots(figsize=(9, 9))
+    fig, ax = plt.subplots(figsize=(9, 9.3))
     ax.imshow(img, cmap="gray", vmin=DB_RANGE[0], vmax=DB_RANGE[1], extent=ext, origin="upper")
-    patches = []
-    for b in boxes:
-        r = Rectangle((b["e0"], b["n0"]), b["e1"] - b["e0"], b["n1"] - b["n0"], fill=False, edgecolor="lime", lw=1.2)
-        ax.add_patch(r)
-        patches.append(r)
-    L = 0.12 * (ext[1] - ext[0])                                # arrow showing the radar direction
-    ax.annotate("", xy=(ext[0] + 0.15 * (ext[1] - ext[0]) + L * math.sin(math.radians(az)),
-                        ext[2] + 0.15 * (ext[3] - ext[2]) + L * math.cos(math.radians(az))),
-                xytext=(ext[0] + 0.15 * (ext[1] - ext[0]), ext[2] + 0.15 * (ext[3] - ext[2])),
+    orig, moved = [], []
+    for i in inside:
+        b = boxes[i]
+        w, h = b["e1"] - b["e0"], b["n1"] - b["n0"]
+        orig.append(ax.add_patch(Rectangle((b["e0"], b["n0"]), w, h, fill=False, edgecolor="orange", lw=1, ls="--")))
+        moved.append(ax.add_patch(Rectangle((b["e0"], b["n0"]), w, h, fill=False, edgecolor="lime", lw=1.5)))
+    x0, y0 = ext[0] + 0.12 * (ext[1] - ext[0]), ext[2] + 0.12 * (ext[3] - ext[2])
+    L = 0.1 * (ext[1] - ext[0])
+    ax.annotate("", xy=(x0 + L * math.sin(math.radians(az)), y0 + L * math.cos(math.radians(az))), xytext=(x0, y0),
                 arrowprops=dict(arrowstyle="->", color="yellow", lw=2))
-    ax.text(ext[0] + 0.02 * (ext[1] - ext[0]), ext[2] + 0.03 * (ext[3] - ext[2]), "to radar", color="yellow")
+    ax.text(x0, y0 - 0.05 * (ext[3] - ext[2]), "to radar", color="yellow", ha="center")
     ax.set_xlabel("metres east"); ax.set_ylabel("metres north")
-    state = dict(sel=None, moves=[], drawn=[])
+    ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[2], ext[3])
+    st = dict(dE=0.0, dN=0.0, drag=None)
 
-    def refresh_title():
-        if not state["moves"]:
-            ax.set_title("click a box, then click the ship's true centre  (u = undo, s = save)", fontsize=10)
-        else:
-            r = height_from_moves([m["d"] for m in state["moves"]], graze, az, h_plane)
-            ax.set_title(f"{r['n']} moves: height offset {r['dh_mean']:+.1f} +/- {r['dh_std']:.1f} m  ->  ships at "
-                         f"{h_plane + r['dh_mean']:.1f} m ellipsoid height;  across-range {r['across_mean']:+.1f} m",
-                         fontsize=10)
+    def redraw():
+        for k, i in enumerate(inside):
+            moved[k].set_xy((boxes[i]["e0"] + st["dE"], boxes[i]["n0"] + st["dN"]))
+        m = shift_metrics(st["dE"], st["dN"], graze, az, h_plane, lat_c)
+        ax.set_title(f"shift east {m['east_m']:+.1f} m, north {m['north_m']:+.1f} m  |  along radar {m['along_radar_m']:+.1f} m"
+                     f" -> height offset {m['height_offset_m']:+.1f} m (ships at {m['h_ships']:.1f} m)  |  across "
+                     f"{m['across_m']:+.1f} m\ndrag a box onto its ship;  r = reset,  s = save", fontsize=9)
         fig.canvas.draw_idle()
 
-    def on_click(ev):
-        if ev.inaxes is not ax or (fig.canvas.toolbar is not None and fig.canvas.toolbar.mode):
+    def toolbar_busy():
+        return fig.canvas.toolbar is not None and bool(fig.canvas.toolbar.mode)
+
+    def on_press(ev):
+        if ev.inaxes is not ax or ev.button != 1 or toolbar_busy():
             return
-        if ev.button == 3:                                        # right click: un-pick
-            if state["sel"] is not None:
-                patches[state["sel"]].set_edgecolor("lime")
-            state["sel"] = None
-            fig.canvas.draw_idle()
+        for i in inside:
+            b = boxes[i]
+            if b["e0"] + st["dE"] <= ev.xdata <= b["e1"] + st["dE"] and b["n0"] + st["dN"] <= ev.ydata <= b["n1"] + st["dN"]:
+                st["drag"] = (ev.xdata, ev.ydata, st["dE"], st["dN"])
+                return
+
+    def on_move(ev):
+        if st["drag"] is None or ev.inaxes is not ax or ev.xdata is None:
             return
-        if ev.button != 1:
-            return
-        if state["sel"] is None:                                  # pick the box under the click
-            for i, b in enumerate(boxes):
-                if b["e0"] <= ev.xdata <= b["e1"] and b["n0"] <= ev.ydata <= b["n1"]:
-                    state["sel"] = i
-                    patches[i].set_edgecolor("red")
-                    fig.canvas.draw_idle()
-                    return
-            return
-        b = boxes[state["sel"]]                                   # second click: the ship's true centre
-        ce, cn = 0.5 * (b["e0"] + b["e1"]), 0.5 * (b["n0"] + b["n1"])
-        d = (ev.xdata - ce, ev.ydata - cn)
-        w, h = b["e1"] - b["e0"], b["n1"] - b["n0"]
-        art = [ax.add_patch(Rectangle((ev.xdata - w / 2, ev.ydata - h / 2), w, h, fill=False, edgecolor="cyan", lw=1.5)),
-               ax.add_patch(FancyArrowPatch((ce, cn), (ev.xdata, ev.ydata), arrowstyle="->", color="cyan",
-                                            mutation_scale=12))]
-        state["moves"].append(dict(id=b["id"], d=d, from_en=(ce, cn), to_en=(ev.xdata, ev.ydata)))
-        state["drawn"].append(art)
-        patches[state["sel"]].set_edgecolor("orange")
-        state["sel"] = None
-        r = height_from_moves([d], graze, az, h_plane)
-        print(f"box {b['id']}: moved east {d[0]:+.1f} m, north {d[1]:+.1f} m -> along radar {r['along_m'][0]:+.1f} m "
-              f"(height offset {r['dh'][0]:+.1f} m), across {r['across_m'][0]:+.1f} m")
-        refresh_title()
+        x, y, e, n = st["drag"]
+        st["dE"], st["dN"] = e + ev.xdata - x, n + ev.ydata - y
+        redraw()
+
+    def on_release(ev):
+        if st["drag"] is not None:
+            st["drag"] = None
+            m = shift_metrics(st["dE"], st["dN"], graze, az, h_plane, lat_c)
+            print(f"shift east {m['east_m']:+.2f} m, north {m['north_m']:+.2f} m (|{m['total_m']:.1f}| m); along radar "
+                  f"{m['along_radar_m']:+.2f} m -> height offset {m['height_offset_m']:+.2f} m; across {m['across_m']:+.2f} m")
 
     def on_key(ev):
-        if ev.key == "u" and state["moves"]:
-            state["moves"].pop()
-            for a in state["drawn"].pop():
-                a.remove()
-            refresh_title()
+        if ev.key == "r":
+            st["dE"] = st["dN"] = 0.0
+            redraw()
         elif ev.key == "s":
-            report()
+            save()
 
-    def report():
-        if not state["moves"]:
-            print("no moves yet")
-            return
-        r = height_from_moves([m["d"] for m in state["moves"]], graze, az, h_plane)
-        h_true = h_plane + r["dh_mean"]
-        print(f"\n{r['n']} moves: height offset {r['dh_mean']:+.2f} +/- {r['dh_std']:.2f} m -> ships at {h_true:.2f} m "
-              f"(ellipsoid); across-range shift {r['across_mean']:+.1f} m (not explained by height)")
-        cands = data_heights(CPHD_PATH, GEC_PATH, lat_c, lon_c, h_plane)
-        print("heights in the data (difference to the clicked estimate):")
+    def save():
+        m = shift_metrics(st["dE"], st["dN"], graze, az, h_plane, lat_c)
+        print(f"\ntranslation: east {m['east_m']:+.2f} m, north {m['north_m']:+.2f} m  "
+              f"(lon {m['dlon_deg']:+.8f} deg, lat {m['dlat_deg']:+.8f} deg)")
+        print(f"along radar {m['along_radar_m']:+.2f} m -> height offset {m['height_offset_m']:+.2f} m: "
+              f"ships at {m['h_ships']:.2f} m ellipsoid height (image plane {h_plane:.2f} m)")
+        print(f"across radar {m['across_m']:+.2f} m (not explained by height)")
+        cands = data_heights(lat_c, lon_c, h_plane)
+        print("heights in the data (difference to the ships' height from your drag):")
         best = None
         for k, v in cands.items():
-            diff = v - h_true
-            print(f"  {k:32s} {v:9.2f} m   ({diff:+.2f} m)")
-            if best is None or abs(diff) < abs(best[1]):
-                best = (k, diff)
-        if best is not None:
-            tol = max(3.0, 2 * r["dh_std"])
-            print(f"closest: {best[0]} ({best[1]:+.2f} m) -> "
-                  + ("consistent with the clicks" if abs(best[1]) <= tol else "none of these heights explains the shift"))
-        if OUT_JSON:
-            with open(OUT_JSON, "w") as fh:
-                json.dump(dict(tif=TIF_PATH, boxes_json=BOXES_JSON, h_plane=h_plane, graze_deg=graze, radar_az_deg=az,
-                               moves=[dict(id=m["id"], east_m=m["d"][0], north_m=m["d"][1]) for m in state["moves"]],
-                               height_offset_mean_m=r["dh_mean"], height_offset_std_m=r["dh_std"],
-                               ships_height_m=h_true, across_range_mean_m=r["across_mean"], data_heights=cands),
-                          fh, indent=1, default=float)
-            print("saved", OUT_JSON)
+            print(f"  {k:32s} {v:9.2f} m   ({v - m['h_ships']:+.2f} m)")
+            if best is None or abs(v - m["h_ships"]) < abs(best[1]):
+                best = (k, v - m["h_ships"])
+        if best:
+            print(f"closest: {best[0]} ({best[1]:+.2f} m)" + ("  -> matches" if abs(best[1]) <= 3 else
+                                                              "  -> none of these heights explains the shift"))
+        out = copy.deepcopy(raw)
+        o_root, o_items = box_items(out)
+        for it in o_items:                                     # same metres for every box, degrees at its own latitude
+            lo0, la0, lo1, la1 = it["bbox_geo"]
+            bl, bo = m_per_deg(0.5 * (la0 + la1))
+            dlo, dla = st["dE"] / bo, st["dN"] / bl
+            it["bbox_geo_original"] = [lo0, la0, lo1, la1]
+            it["bbox_geo"] = [lo0 + dlo, la0 + dla, lo1 + dlo, la1 + dla]
+        o_root["box_translation"] = dict(m, source_tif=TIF_PATH, source_json=BOXES_JSON, data_heights=cands,
+                                         note="every bbox_geo moved by east_m / north_m; originals in bbox_geo_original")
+        with open(OUT_JSON, "w") as fh:
+            json.dump(out, fh, indent=1, default=float)
+        print(f"saved {len(o_items)} moved boxes to {OUT_JSON}")
 
-    fig.canvas.mpl_connect("button_press_event", on_click)
+    fig.canvas.mpl_connect("button_press_event", on_press)
+    fig.canvas.mpl_connect("motion_notify_event", on_move)
+    fig.canvas.mpl_connect("button_release_event", on_release)
     fig.canvas.mpl_connect("key_press_event", on_key)
-    refresh_title()
+    redraw()
     plt.show()
-    report()                                                      # also print the result when the window closes
 
 
 if __name__ == "__main__":
