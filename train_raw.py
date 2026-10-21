@@ -25,7 +25,7 @@ so labels and data stay consistent. Skew: focal loss plus the same balanced samp
     python train_raw.py predict --ckpt runs/raw1/best.pt --crops /crops --out preds.geojson
     python train_raw.py selftest
 """
-import argparse, json, math, os, random, sys, time
+import argparse, glob, json, math, os, random, sys, time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -280,22 +280,41 @@ def decode_at(off, size, idx, cells, cell_m):
 
 
 def compute_loss(out, b, cfg):
+    """CenterNet losses. With --tol-m R > 0 the position only has to be right to within R metres (labels that may be
+    shifted by tens of metres, e.g. a height / alignment offset between the image and the GEC boxes):
+      heat    the positive term scores the BEST cell within R of each ship centre (multiple-instance), and every cell
+              within R of a centre is left out of the negative term, so firing anywhere near the ship costs nothing
+      offset  epsilon-insensitive L1: errors smaller than R (in cells) cost nothing
+      size    L1 on log width / height, unchanged (a shift does not change the size)
+      giou    on the box SHAPE only: predicted size placed at the true centre, so position cannot hurt it
+    With R = 0 these are the plain CenterNet losses."""
     from torchvision.ops import generalized_box_iou_loss
     p = torch.sigmoid(out["heat"][:, 0]).clamp(1e-4, 1 - 1e-4)
     t, ign = b["heat"], b["ign"]
     pos = (t >= 1.0).float()
     n_pos = pos.sum().clamp(min=1.0)
-    l_pos = -(torch.log(p) * (1 - p) ** 2 * pos).sum()
-    l_neg = -(torch.log(1 - p) * p ** 2 * (1 - t) ** 4 * (1 - pos) * (1 - ign)).sum()
+    kc = int(round(cfg.get("tol_m", 0.0) / cfg["cell_m"]))
+    if kc > 0:
+        win = 2 * kc + 1
+        p_best = F.max_pool2d(p[:, None], win, 1, kc)[:, 0]                 # best score within R of each cell
+        near = F.max_pool2d(pos[:, None], win, 1, kc)[:, 0]                 # cells within R of a ship centre
+        l_pos = -(torch.log(p_best) * (1 - p_best) ** 2 * pos).sum()
+        l_neg = -(torch.log(1 - p) * p ** 2 * (1 - t) ** 4 * (1 - near) * (1 - ign)).sum()
+    else:
+        l_pos = -(torch.log(p) * (1 - p) ** 2 * pos).sum()
+        l_neg = -(torch.log(1 - p) * p ** 2 * (1 - t) ** 4 * (1 - pos) * (1 - ign)).sum()
     heat = (l_pos + l_neg) / n_pos
     m = b["mask"][..., None]
     k = m.sum().clamp(min=1.0)
     off_p, size_p = gather(out["off"], b["idx"]), gather(out["size"], b["idx"])
-    off = (torch.abs(off_p - b["off"]) * m).sum() / k
+    off_err = torch.abs(off_p - b["off"])
+    if kc > 0:
+        off_err = F.relu(off_err - kc)                                       # dead zone of R
+    off = (off_err * m).sum() / k
     size = (torch.abs(size_p - b["size"]) * m).sum() / k
     losses = dict(heat=heat, offset=off, size=0.1 * size)
     if cfg["giou_weight"] > 0:
-        bp = decode_at(off_p, size_p, b["idx"], cfg["cells"], cfg["cell_m"])
+        bp = decode_at(b["off"] if kc > 0 else off_p, size_p, b["idx"], cfg["cells"], cfg["cell_m"])
         sel = b["mask"] > 0
         g = generalized_box_iou_loss(bp[sel], b["box"][sel], reduction="sum") / k if sel.any() else heat * 0
         losses["giou"] = cfg["giou_weight"] * g
@@ -308,7 +327,7 @@ def decode(out, cfg, k=100, thr=0.05):
     heat = torch.sigmoid(out["heat"][:, 0])
     peak = heat == F.max_pool2d(heat[:, None], 3, 1, 1)[:, 0]
     sc, idx = (heat * peak).flatten(1).topk(min(k, heat[0].numel()), dim=1)
-    boxes = decode_at(gather(out["off"], idx), gather(out["size"], idx), idx, cfg["cells"], cfg["cell_m"])
+    boxes = decode_at(gather(out["off"], idx).clamp(0, 1), gather(out["size"], idx), idx, cfg["cells"], cfg["cell_m"])
     res = []
     for s, bx in zip(sc, boxes):
         keep = s >= thr
@@ -329,6 +348,29 @@ def to_records(dets, b, cfg):
     return recs
 
 
+def centre_match(records, tol_m, score_thr):
+    """Position-tolerant counts: a detection is a hit if its centre is within tol_m of an unmatched ship centre
+    (records are on a 1 m grid, so pixels = metres). Detections near ignored ships are not counted."""
+    tp = fp = n_gt = 0
+    for r in records:
+        keep = r["scores"] >= score_thr
+        sc, db, gb, ig = r["scores"][keep], r["boxes"][keep], r["gt"], r["ignore"]
+        dc = 0.5 * (db[:, :2] + db[:, 2:]) if len(db) else np.zeros((0, 2))
+        gc = 0.5 * (gb[:, :2] + gb[:, 2:]) if len(gb) else np.zeros((0, 2))
+        used = np.zeros(len(gb), bool)
+        n_gt += int((~ig).sum()) if len(ig) else 0
+        for d in np.argsort(-sc):
+            dist = np.hypot(*(gc - dc[d]).T) if len(gc) else np.zeros(0)
+            cand = [j for j in np.argsort(dist) if dist[j] <= tol_m]
+            real = [j for j in cand if not ig[j] and not used[j]]
+            if real:
+                used[real[0]] = True
+                tp += 1
+            elif not any(ig[j] for j in cand):
+                fp += 1
+    return tp, fp, n_gt
+
+
 def summarise(records, cfg, score_thr=0.5):
     tp = fp = n_gt = 0
     errs, neg_hit, n_neg = [], 0, 0
@@ -342,7 +384,14 @@ def summarise(records, cfg, score_thr=0.5):
     return dict(crops=len(records), gt=n_gt, ap30=td.average_precision(records, 0.3), ap50=td.average_precision(records, 0.5),
                 precision=tp / max(tp + fp, 1), recall=tp / max(n_gt, 1), false_alarms_per_km2=fp / max(area, 1e-9),
                 centre_error_m=float(np.mean(errs)) if errs else float("nan"),
-                negative_crops_with_detection=neg_hit / max(n_neg, 1), score_thr=score_thr)
+                negative_crops_with_detection=neg_hit / max(n_neg, 1), score_thr=score_thr,
+                **_centre_metrics(records, cfg, score_thr))
+
+
+def _centre_metrics(records, cfg, score_thr):
+    tol = float(cfg.get("eval_tol_m", 25.0))
+    tp, fp, n_gt = centre_match(records, tol, score_thr)
+    return {f"recall_within_{tol:.0f}m": tp / max(n_gt, 1), f"precision_within_{tol:.0f}m": tp / max(tp + fp, 1)}
 
 
 def to_device(b, device):
@@ -368,12 +417,42 @@ def evaluate(model, loader, device, cfg, score_thr=0.5):
 def cfg_of(a):
     return dict(cells=a.cells, cell_m=a.cell_m, shift_m=a.shift_m, min_visible=a.min_visible, max_objs=a.max_objs,
                 pulses=a.pulses, samples=a.samples, patch=a.patch, dim=a.dim, depth=a.depth, heads=a.heads,
-                dec_dim=a.dec_dim, dec_heads=a.dec_heads, dec_layers=a.dec_layers, giou_weight=a.giou_weight, amp=a.amp,
+                dec_dim=a.dec_dim, dec_heads=a.dec_heads, dec_layers=a.dec_layers, giou_weight=a.giou_weight, amp=a.amp, tol_m=a.tol_m,
+                eval_tol_m=a.eval_tol_m,
                 arch=a.arch, pretrained=not a.no_pretrained, fixed_dft=a.fixed_dft)
 
 
 def build_model(cfg):
     return FourierShipNet(cfg) if cfg.get("arch", "vit") == "fourier" else RawShipNet(cfg)
+
+
+def adjusted_scenes(ann_root):
+    """Scenes whose annotations.json under ann_root carries a box_translation (written by box_adjust_server.py Apply)."""
+    out = set()
+    for p in glob.glob(os.path.join(ann_root or "", "*", "annotation*.json")):
+        if p.endswith("_pre_adjustment.json"):
+            continue
+        try:
+            with open(p) as f:
+                js = json.load(f)
+        except Exception:
+            continue
+        js = js[0] if isinstance(js, list) else js
+        if js.get("box_translation"):
+            m = td.SCENE_RE.search(js.get("scene_name") or os.path.basename(os.path.dirname(p)))
+            if m:
+                out.add(m.group(0))
+    return out
+
+
+def train_eval_subset(tr_e, tr_pos, va_pos_frac, n, seed):
+    """Fixed training crops for a training-set AP, with the validation set's share of positives so the two compare."""
+    rng = np.random.default_rng(seed + 12345)
+    pos, neg = np.flatnonzero(tr_pos), np.flatnonzero(~tr_pos)
+    n_pos = min(len(pos), int(round(n * va_pos_frac)) if va_pos_frac == va_pos_frac else n // 2)
+    n_neg = min(len(neg), n - n_pos)
+    idx = np.sort(np.concatenate([rng.choice(pos, n_pos, replace=False), rng.choice(neg, n_neg, replace=False)]))
+    return [tr_e[i] for i in idx]
 
 
 def train(a):
@@ -386,6 +465,18 @@ def train(a):
     anns = td.load_scene_annotations(a.ann_root)
     if not entries:
         sys.exit(f"no crops listed in {os.path.join(a.crops, 'manifest.jsonl')}: run build_crops.py (without --dry-run) first")
+    if a.only_adjusted:                                 # only scenes whose boxes were fixed with box_adjust_server.py
+        keep = adjusted_scenes(a.ann_root)
+        all_sc = sorted({e["scene"] for e in entries})
+        dropped = [s for s in all_sc if s not in keep]
+        entries = [e for e in entries if e["scene"] in keep]
+        say(f"--only-adjusted: {len(all_sc) - len(dropped)} of {len(all_sc)} scenes kept; left out: {dropped or 'none'}")
+        if not entries:
+            sys.exit(f"no adjusted scenes in {a.ann_root} (looking for annotations.json with box_translation)")
+    if a.scenes:
+        entries = [e for e in entries if any(s in e["scene"] for s in a.scenes)]
+    if a.exclude_scenes:
+        entries = [e for e in entries if not any(s in e["scene"] for s in a.exclude_scenes)]
     tr_e, va_e, val_scenes = td.split_scenes(entries, a.val_scenes, a.val_frac, a.seed)
     if a.overfit:
         tr_e = va_e = entries
@@ -393,6 +484,12 @@ def train(a):
     tr, va = RawSet(a.crops, tr_e, anns, cfg, True), RawSet(a.crops, va_e, anns, cfg, False)
     say(f"crops: {len(tr)} train ({int(tr.positive.sum())} positive), {len(va)} val ({int(va.positive.sum())} positive); "
         f"val scenes {val_scenes or 'none (crop split)'}; {world} process(es) on {device}")
+    tre = None                                          # training-set AP: fixed crops, no augmentation
+    if a.train_eval_n > 0 and len(tr):
+        te_e = train_eval_subset(tr_e, tr.positive, float(va.positive.mean()) if len(va) else float("nan"),
+                                 min(a.train_eval_n, len(tr)), a.seed)
+        tre = RawSet(a.crops, te_e, anns, cfg, False)
+        say(f"training-set AP on {len(tre)} fixed training crops ({int(tre.positive.sum())} positive)")
     os.makedirs(a.out, exist_ok=True)
     writer = None
     if main:
@@ -408,6 +505,8 @@ def train(a):
     dl = torch.utils.data.DataLoader(tr, batch_size=a.batch, sampler=sampler, num_workers=a.workers, collate_fn=collate,
                                      pin_memory=device.type == "cuda", persistent_workers=a.workers > 0, drop_last=True)
     vdl = torch.utils.data.DataLoader(va, batch_size=a.batch, shuffle=False, num_workers=a.workers, collate_fn=collate)
+    tdl = (torch.utils.data.DataLoader(tre, batch_size=a.batch, shuffle=False, num_workers=a.workers, collate_fn=collate)
+           if tre is not None else None)
     model = build_model(cfg).to(device)
     say(f"model: {sum(p.numel() for p in model.parameters()) / 1e6:.1f} M parameters")
     if a.resume:
@@ -473,6 +572,16 @@ def train(a):
                 for k, v in m.items():
                     if isinstance(v, (int, float)) and k not in ("epoch", "step", "score_thr") and v == v:
                         writer.add_scalar(f"eval/{k}", v, step)
+            if tdl is not None:
+                mt, _ = evaluate(model, tdl, device, cfg)
+                mt.update(epoch=epoch, step=step)
+                say(f"epoch {epoch} TRAIN set: AP30 {mt['ap30']:.3f}, AP50 {mt['ap50']:.3f}, precision {mt['precision']:.3f}, "
+                    f"recall {mt['recall']:.3f}, centre error {mt['centre_error_m']:.1f} m")
+                log_f.write(json.dumps(dict(eval_train=mt)) + "\n"); log_f.flush()
+                if writer is not None:
+                    for k, v in mt.items():
+                        if isinstance(v, (int, float)) and k not in ("epoch", "step", "score_thr") and v == v:
+                            writer.add_scalar(f"eval_train/{k}", v, step)
             state = dict(model=core.state_dict(), cfg=cfg, epoch=epoch, step=step, metrics=m)
             torch.save(state, os.path.join(a.out, "last.pt"))
             score = m["ap30"] if m["ap30"] == m["ap30"] else -m["false_alarms_per_km2"]
@@ -610,6 +719,12 @@ def parser():
     t.add_argument("--out", required=True)
     t.add_argument("--val-scenes", nargs="*")
     t.add_argument("--val-frac", type=float, default=0.2)
+    t.add_argument("--only-adjusted", action="store_true",
+                   help="use only scenes whose --ann-root annotations.json was adjusted with box_adjust_server.py")
+    t.add_argument("--scenes", nargs="*", help="use only these scenes (substring match)")
+    t.add_argument("--exclude-scenes", nargs="*", help="leave these scenes out (substring match)")
+    t.add_argument("--train-eval-n", type=int, default=400,
+                   help="training-set AP each eval on this many fixed training crops (0 = off)")
     t.add_argument("--overfit", action="store_true", help="train and validate on the same crops (sanity check)")
     t.add_argument("--epochs", type=int, default=50)
     t.add_argument("--max-iters", type=int, default=0)
@@ -642,6 +757,10 @@ def parser():
     t.add_argument("--dec-heads", type=int, default=4)
     t.add_argument("--dec-layers", type=int, default=2)
     t.add_argument("--giou-weight", type=float, default=1.0)
+    t.add_argument("--tol-m", type=float, default=0.0,
+                   help="position tolerance in metres for the losses (e.g. 24): boxes may be off by this much")
+    t.add_argument("--eval-tol-m", type=float, default=25.0,
+                   help="extra metrics: a detection counts if its centre is within this many metres of a ship")
     t.add_argument("--amp", action="store_true", help="bfloat16 autocast on GPU")
     t.add_argument("--arch", choices=["vit", "fourier"], default="fourier",
                    help="fourier: learnable DFT front end + CNN (default); vit: patch ViT encoder + cell decoder")
