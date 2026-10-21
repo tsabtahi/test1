@@ -402,13 +402,13 @@ def to_device(b, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, cfg, score_thr=0.5):
+def evaluate(model, loader, device, cfg, score_thr=0.5, min_score=0.05):
     core = model.module if hasattr(model, "module") else model
     core.eval()
     records = []
     for b in loader:
         b = to_device(b, device)
-        records += to_records(decode(core(b), cfg), b, cfg)
+        records += to_records(decode(core(b), cfg, thr=min_score), b, cfg)
     core.train()
     return summarise(records, cfg, score_thr), records
 
@@ -494,7 +494,8 @@ def train(a):
     writer = None
     if main:
         with open(os.path.join(a.out, "config.json"), "w") as f:
-            json.dump(dict(cfg, args=vars(a), val_scenes=val_scenes), f, indent=1, default=str)
+            json.dump(dict(cfg, args=vars(a), val_scenes=val_scenes, train_scenes=sorted({e["scene"] for e in tr_e})), f,
+                      indent=1, default=str)
         st = tv.dataset_stats(tr, va)
         say("dataset statistics:\n" + tv.stats_text(st))
         writer = tv.make_writer(a.out) if not a.no_tensorboard else None
@@ -619,16 +620,69 @@ def predict(a):
     model = build_model(cfg).to(device)
     model.load_state_dict(st["model"])
     entries = td.read_manifest(a.crops)
+    run_cfg = os.path.join(os.path.dirname(os.path.abspath(a.ckpt)), "config.json")
+    if a.split != "all":                                # the run's own split, from its config.json
+        if not os.path.exists(run_cfg):
+            sys.exit(f"--split {a.split} needs {run_cfg}; use --split all or --scenes")
+        with open(run_cfg) as f:
+            rc = json.load(f)
+        val = set(rc.get("val_scenes") or [])
+        seen = set(rc.get("train_scenes") or [])
+        if a.split == "val":
+            entries = [e for e in entries if e["scene"] in val]
+        else:                                           # train: scenes the run trained on (adjusted ones if it used it)
+            keep = seen or ((adjusted_scenes(rc["args"].get("ann_root")) if rc["args"].get("only_adjusted") else
+                             {e["scene"] for e in entries}) - val)
+            entries = [e for e in entries if e["scene"] in keep]
+        print(f"--split {a.split}: {len({e['scene'] for e in entries})} scenes, {len(entries)} crops")
     if a.scenes:
         entries = [e for e in entries if any(s in e["scene"] for s in a.scenes)]
+    if not entries:
+        sys.exit("no crops to run on")
     ds = RawSet(a.crops, entries, td.load_scene_annotations(a.ann_root), cfg, train=False)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, num_workers=a.workers, collate_fn=collate)
-    m, records = evaluate(model, dl, device, cfg, a.score_thr)
-    n = td.detections_geojson(records, a.out, a.score_thr)
-    print(f"{len(ds)} crops, {n} detections after merging overlaps -> {a.out}")
-    if ds.anns:
-        print(json.dumps(m, indent=1))
-    return m
+    thrs = sorted(a.score_thrs) if a.score_thrs else [a.score_thr]
+    m0, records = evaluate(model, dl, device, cfg, thrs[0], min_score=min(thrs))   # one pass, every threshold after
+    if not a.score_thrs:
+        n = td.detections_geojson(records, a.out, a.score_thr)
+        print(f"{len(ds)} crops, {n} detections after merging overlaps -> {a.out}")
+        if ds.anns:
+            print(json.dumps(m0, indent=1))
+        return m0
+    os.makedirs(a.out, exist_ok=True)                   # --out is a folder when several thresholds are given
+    rows = []
+    collage = None
+    if a.collage_n > 0:
+        try:
+            collage = tv.Collage(ds, cfg, device, n=a.collage_n, pixel_m=a.collage_pixel_m, seed=0)
+        except Exception as e:
+            print(f"collage off ({type(e).__name__}: {e})")
+    for t in thrs:
+        m = summarise(records, cfg, t)
+        n = td.detections_geojson(records, os.path.join(a.out, f"detections_thr{t:g}.geojson"), t)
+        rows.append(dict(score_thr=t, detections=n, **{k: v for k, v in m.items() if k != "score_thr"}))
+        if collage is not None:
+            collage.render(model, decode, collate, to_device, st.get("epoch", -1), score_thr=t).save(
+                os.path.join(a.out, f"collage_thr{t:g}.png"))
+    keys = ["score_thr", "detections", "precision", "recall", "recall_within_25m", "precision_within_25m",
+            "false_alarms_per_km2", "negative_crops_with_detection", "centre_error_m"]
+    keys = [k for k in keys if k in rows[0]]
+    print(f"{len(ds)} crops, {rows[0]['gt']} ships; AP30 {m0['ap30']:.3f}, AP50 {m0['ap50']:.3f} (AP does not depend on the threshold)")
+    short = dict(score_thr="thr", detections="dets", precision="prec", recall="recall", recall_within_25m="rec25m",
+                 precision_within_25m="prec25m", false_alarms_per_km2="FA/km2", negative_crops_with_detection="neg_hit",
+                 centre_error_m="ctr_err_m")
+    print(" ".join(f"{short[k]:>9s}" for k in keys))
+    for r in rows:
+        print(" ".join(f"{r[k]:9g}" if k in ("score_thr", "detections") else f"{r[k]:9.3f}" for k in keys))
+    import csv
+    with open(os.path.join(a.out, "thresholds.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+    with open(os.path.join(a.out, "thresholds.json"), "w") as f:
+        json.dump(dict(ckpt=a.ckpt, epoch=st.get("epoch"), ap30=m0["ap30"], ap50=m0["ap50"], rows=rows), f, indent=1,
+                  default=float)
+    print(f"-> {a.out}: thresholds.csv, detections_thr<t>.geojson" + (", collage_thr<t>.png" if collage else ""))
+    return rows
 
 
 # ------------------------------------------------------------------ self-test
@@ -774,6 +828,12 @@ def parser():
     p.add_argument("--out", required=True)
     p.add_argument("--scenes", nargs="*")
     p.add_argument("--score-thr", type=float, default=0.3)
+    p.add_argument("--score-thrs", type=float, nargs="*",
+                   help="several thresholds: metrics table + a GeoJSON (+ collage) per threshold; --out is then a folder")
+    p.add_argument("--split", choices=["val", "train", "all"], default="all",
+                   help="val / train = that run's own scene split (config.json next to --ckpt)")
+    p.add_argument("--collage-n", type=int, default=8, help="crops per collage with --score-thrs (0 = none)")
+    p.add_argument("--collage-pixel-m", type=float, default=2.0)
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--workers", type=int, default=4)
     s = sub.add_parser("selftest")
