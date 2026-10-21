@@ -21,4 +21,17 @@ docker run --rm --gpus '"device=1"' --user $(id -u):$(id -g) -e HOME=/tmp \
   cphd-gpu /app/train_raw.py predict --ckpt /runs/fourier_adj_r1/best.pt --crops /crops --ann-root /ann \
   --split val --score-thrs 0.05 0.1 0.15 0.2 --batch 1 --workers 2 --collage-n 8 --collage-pixel-m 4 \
   --out /runs/fourier_adj_r1/pred_val_coll
+
+
+docker rm -f train_adj
+
+docker run -d --name train_fixed --gpus '"device=1"' --ipc=host --user $(id -u):$(id -g) -e HOME=/tmp \
+  -v $PWD/train_raw.py:/app/train_raw.py:ro \
+  -v /home/tabtahi/SATLOCK/dataset/annotations_adjusted:/ann:ro \
+  -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops:ro -v /home/tabtahi/SATLOCK/runs:/runs \
+  cphd-gpu /app/train_raw.py train \
+  --crops /crops --ann-root /ann --out /runs/fourier_adj_fixed \
+  --only-adjusted --arch fourier --fixed-dft --amp \
+  --epochs 10 --samples-per-epoch 2000 --lr 1.5e-4 --shift-m 128 \
+  --collage-every 2 --train-eval-n 400
 ```
