@@ -19,5 +19,6 @@ docker run --rm --gpus '"device=1"' --user $(id -u):$(id -g) -e HOME=/tmp \
   -v /home/tabtahi/SATLOCK/dataset/annotations_adjusted:/ann:ro \
   -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops:ro -v /home/tabtahi/SATLOCK/runs:/runs \
   cphd-gpu /app/train_raw.py predict --ckpt /runs/fourier_adj_r1/best.pt --crops /crops --ann-root /ann \
-  --split val --score-thrs 0.001 0.05 0.1 0.15 0.2 0.25 0.3 --out /runs/fourier_adj_r1/pred_val
+  --split val --score-thrs 0.05 0.1 0.15 0.2 --batch 1 --workers 2 --collage-n 8 --collage-pixel-m 4 \
+  --out /runs/fourier_adj_r1/pred_val_coll
 ```
