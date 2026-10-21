@@ -2,13 +2,9 @@
 
 
 ```
-docker build -t cphd-gpu .
-docker run -d --name train_adj --gpus '"device=2,3,4,5"' --ipc=host --user $(id -u):$(id -g) -e HOME=/tmp \
+docker run -d --name train_adj --gpus '"device=1"' --ipc=host --user $(id -u):$(id -g) -e HOME=/tmp \
   -v /home/tabtahi/SATLOCK/dataset/annotations_adjusted:/ann:ro \
   -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops:ro -v /home/tabtahi/SATLOCK/runs:/runs \
-  --entrypoint torchrun cphd-gpu --nproc_per_node=4 /app/train_raw.py train \
-  --crops /crops --ann-root /ann --out /runs/fourier_adj_r1 --only-adjusted --arch fourier --amp
-
-
-python3 -c "import json;a=json.load(open('/home/tabtahi/SATLOCK/runs/fourier_full_r2/config.json'))['args'];print({k:a[k] for k in ('arch','fixed_dft','front_lr_scale','lr','batch','epochs','tol_m','shift_m','amp')})"
+  cphd-gpu /app/train_raw.py train \
+  --crops /crops --ann-root /ann --out /runs/fourier_adj_r1 --only-adjusted --arch fourier --amp```
 ```
