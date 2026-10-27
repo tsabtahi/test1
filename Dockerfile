@@ -39,6 +39,6 @@ RUN pip install tensorboard
 ENV HOME=/tmp CUPY_CACHE_DIR=/tmp/cupy_cache MPLCONFIGDIR=/tmp/matplotlib
 
 WORKDIR /app
-COPY build_crops.py train_detector.py train_raw.py train_viz.py fourier_net.py png_output.py box_adjust_server.py /app/
+COPY build_crops.py train_detector.py train_raw.py train_viz.py fourier_net.py png_output.py box_adjust_server.py heat_regions.py /app/
 ENTRYPOINT ["python"]
 CMD ["/app/train_detector.py", "--help"]
