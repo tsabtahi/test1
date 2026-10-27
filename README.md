@@ -19,8 +19,7 @@ docker run --rm --gpus '"device=1"' --ipc=host --user $(id -u):$(id -g) -e HOME=
   --split val --score-thrs 0.1 0.3 --batch 1 --collage-n 0 --out /runs/fourier_adj_fixed_aug/pred_val \
   --save-heat /runs/fourier_adj_fixed_aug/heat_val
 
-docker run --rm --user $(id -u):$(id -g) \
-  -v $HOME/SATLOCK/cphd_trainer/heat_regions.py:/app/heat_regions.py:ro \
-  -v /home/tabtahi/SATLOCK/runs:/runs cphd-gpu /app/heat_regions.py \
-  --heat /runs/fourier_adj_fixed_aug/heat_val --out /runs/fourier_adj_fixed_aug/heat_val_regions
+docker run --rm --user $(id -u):$(id -g) -v /home/tabtahi/SATLOCK/runs:/runs cphd-gpu /app/heat_regions.py \
+  --heat /runs/fourier_adj_fixed_aug/heat_val --out /runs/fourier_adj_fixed_aug/heat_val_regions \
+  --png-n 30 --png-thr 0.1
 ```
