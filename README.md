@@ -12,7 +12,7 @@ docker run -d --name train_fixed_aug --gpus '"device=1"' --ipc=host --user $(id 
   --epochs 10 --samples-per-epoch 2000 --lr 1.5e-4 --shift-m 128 \
   --collage-every 2 --train-eval-n 400
 
-docker run --rm --gpus '"device=1"' --user $(id -u):$(id -g) -e HOME=/tmp \
+docker run --rm --gpus '"device=1"' --ipc=host --user $(id -u):$(id -g) -e HOME=/tmp \
   -v /home/tabtahi/SATLOCK/dataset/annotations_adjusted:/ann:ro \
   -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops:ro -v /home/tabtahi/SATLOCK/runs:/runs \
   cphd-gpu /app/train_raw.py predict --ckpt /runs/fourier_adj_fixed_aug/best.pt --crops /crops --ann-root /ann \
