@@ -129,6 +129,8 @@ class RawSet(torch.utils.data.Dataset):
             lat, lon = lat + dy / ml, lon + dx / mo
         if d["sgn"] > 0:                                               # one sign convention for the network
             X = np.conj(X)
+        if self.train and cfg.get("aug"):
+            X = augment(X, cfg)
         X = X / max(float(np.sqrt(np.mean(np.abs(X) ** 2))), 1e-12)
         u = 0.5 * (tx + rc)
         u /= np.linalg.norm(u, axis=1, keepdims=True)
@@ -156,6 +158,39 @@ class RawSet(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         return self.get(i)
+
+
+def augment(X, cfg, rng=random):
+    """Signal-only augmentation (labels unchanged), each part with probability aug_p:
+      sub-aperture  keep a random run of aug_min_frac..1 of the pulses (lower cross-range resolution); the run keeps at
+                    least a quarter of itself in each half, so both half-aperture features stay valid
+      sub-band      keep a random run of aug_min_frac..1 of the frequencies (lower range resolution)
+      noise         complex white noise at a random SNR in [aug_snr_db, 30] dB (relative to the crop's power)
+      phase         one random global phase (physically meaningless: the network must ignore it)"""
+    P, S = X.shape
+    pr, mf = cfg.get("aug_p", 0.5), cfg.get("aug_min_frac", 0.6)
+    X = X.copy()
+    if rng.random() < pr:                                              # sub-aperture
+        w = int(round(P * rng.uniform(mf, 1.0)))
+        lo, hi = max(0, int(math.ceil(P / 2 - 0.75 * w))), min(P - w, int(P / 2 - 0.25 * w))
+        if w < P and hi >= lo:
+            s0 = rng.randint(lo, hi)
+            X[:s0] = 0
+            X[s0 + w:] = 0
+    if rng.random() < pr:                                              # sub-band
+        w = int(round(S * rng.uniform(mf, 1.0)))
+        if w < S:
+            s0 = rng.randint(0, S - w)
+            X[:, :s0] = 0
+            X[:, s0 + w:] = 0
+    if rng.random() < pr:                                              # noise
+        snr = rng.uniform(cfg.get("aug_snr_db", 0.0), 30.0)
+        pw = float(np.mean(np.abs(X[X != 0]) ** 2)) if np.any(X) else 1.0
+        sd = math.sqrt(pw * 10 ** (-snr / 10) / 2)
+        nz = (np.random.standard_normal(X.shape) + 1j * np.random.standard_normal(X.shape)) * sd
+        X = X + (nz * (X != 0)).astype(np.complex64)                   # only where there is signal (keeps the windows)
+    X = X * np.complex64(np.exp(1j * rng.uniform(0, 2 * math.pi)))     # phase
+    return X.astype(np.complex64)
 
 
 def td_enu(lat, lon):
@@ -418,7 +453,7 @@ def cfg_of(a):
     return dict(cells=a.cells, cell_m=a.cell_m, shift_m=a.shift_m, min_visible=a.min_visible, max_objs=a.max_objs,
                 pulses=a.pulses, samples=a.samples, patch=a.patch, dim=a.dim, depth=a.depth, heads=a.heads,
                 dec_dim=a.dec_dim, dec_heads=a.dec_heads, dec_layers=a.dec_layers, giou_weight=a.giou_weight, amp=a.amp, tol_m=a.tol_m,
-                eval_tol_m=a.eval_tol_m,
+                eval_tol_m=a.eval_tol_m, aug=a.aug, aug_p=a.aug_p, aug_min_frac=a.aug_min_frac, aug_snr_db=a.aug_snr_db,
                 arch=a.arch, pretrained=not a.no_pretrained, fixed_dft=a.fixed_dft)
 
 
@@ -816,6 +851,11 @@ def parser():
     t.add_argument("--eval-tol-m", type=float, default=25.0,
                    help="extra metrics: a detection counts if its centre is within this many metres of a ship")
     t.add_argument("--amp", action="store_true", help="bfloat16 autocast on GPU")
+    t.add_argument("--aug", action="store_true",
+                   help="signal augmentation in training: random sub-aperture, sub-band, noise, global phase")
+    t.add_argument("--aug-p", type=float, default=0.5, help="probability of each augmentation")
+    t.add_argument("--aug-min-frac", type=float, default=0.6, help="shortest kept run of pulses / frequencies")
+    t.add_argument("--aug-snr-db", type=float, default=0.0, help="lowest SNR of the added noise, dB")
     t.add_argument("--arch", choices=["vit", "fourier"], default="fourier",
                    help="fourier: learnable DFT front end + CNN (default); vit: patch ViT encoder + cell decoder")
     t.add_argument("--no-pretrained", action="store_true", help="fourier: ResNet-18 stem from scratch")
