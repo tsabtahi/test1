@@ -437,13 +437,16 @@ def to_device(b, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, cfg, score_thr=0.5, min_score=0.05):
+def evaluate(model, loader, device, cfg, score_thr=0.5, min_score=0.05, keep=None):
     core = model.module if hasattr(model, "module") else model
     core.eval()
     records = []
     for b in loader:
         b = to_device(b, device)
-        records += to_records(decode(core(b), cfg, thr=min_score), b, cfg)
+        out = core(b)
+        if keep is not None:
+            keep(out, b)
+        records += to_records(decode(out, cfg, thr=min_score), b, cfg)
     core.train()
     return summarise(records, cfg, score_thr), records
 
@@ -677,7 +680,10 @@ def predict(a):
     ds = RawSet(a.crops, entries, td.load_scene_annotations(a.ann_root), cfg, train=False)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, num_workers=a.workers, collate_fn=collate)
     thrs = sorted(a.score_thrs) if a.score_thrs else [a.score_thr]
-    m0, records = evaluate(model, dl, device, cfg, thrs[0], min_score=min(thrs))   # one pass, every threshold after
+    keep = HeatSaver(a.save_heat, cfg) if a.save_heat else None
+    m0, records = evaluate(model, dl, device, cfg, thrs[0], min_score=min(thrs), keep=keep)   # one pass, all thresholds
+    if keep is not None:
+        keep.close(a.ckpt, st.get("epoch"))
     if not a.score_thrs:
         n = td.detections_geojson(records, a.out, a.score_thr)
         print(f"{len(ds)} crops, {n} detections after merging overlaps -> {a.out}")
@@ -718,6 +724,45 @@ def predict(a):
                   default=float)
     print(f"-> {a.out}: thresholds.csv, detections_thr<t>.geojson" + (", collage_thr<t>.png" if collage else ""))
     return rows
+
+
+class HeatSaver:
+    """Writes the network's probability map of every crop to <dir>/<scene>/<crop_id>.npz for experiments outside the
+    detector (watershed, thresholds, ...):
+      heat        (cells, cells) float32, sigmoid of the heat head; row 0 = north edge, column 0 = west edge
+      off, size   (2, cells, cells) float16: the offset / log-size heads (box size at a cell = exp(size) metres E, N)
+      gt_boxes    (K, 4) crop-local metres [e0, n0, e1, n1] (east / north of the crop centre), gt_ignore (K,)
+      lat, lon    crop centre; cell_m, cells
+      geo         [lon_w, lat_n, dlon, dlat]: cell (r, c) covers lon_w + c*dlon .. +dlon, lat_n - r*dlat .. -dlat
+    index.json lists every file."""
+    def __init__(self, out, cfg):
+        self.out, self.cfg, self.rows = out, cfg, []
+        os.makedirs(out, exist_ok=True)
+
+    def __call__(self, out, b):
+        heat = torch.sigmoid(out["heat"][:, 0]).float().cpu().numpy()
+        off, size = out["off"].float().cpu().numpy(), out["size"].float().cpu().numpy()
+        cells, cm = self.cfg["cells"], self.cfg["cell_m"]
+        H = cells * cm / 2
+        for i in range(len(heat)):
+            lat, lon = float(b["lat"][i]), float(b["lon"][i])
+            ml, mo = td.m_per_deg(lat)
+            geo = [lon - H / mo, lat + H / ml, cm / mo, cm / ml]
+            d = os.path.join(self.out, b["scene"][i])
+            os.makedirs(d, exist_ok=True)
+            p = os.path.join(d, b["crop_id"][i] + ".npz")
+            np.savez_compressed(p, heat=heat[i].astype(np.float32), off=off[i].astype(np.float16),
+                                size=size[i].astype(np.float16), gt_boxes=np.asarray(b["gt"][i], np.float32),
+                                gt_ignore=np.asarray(b["gt_ignore"][i], bool), lat=lat, lon=lon, cell_m=cm, cells=cells,
+                                geo=np.array(geo))
+            self.rows.append(dict(scene=b["scene"][i], crop_id=b["crop_id"][i], npz=os.path.relpath(p, self.out),
+                                  n_gt=int((~np.asarray(b["gt_ignore"][i], bool)).sum()), heat_max=float(heat[i].max())))
+
+    def close(self, ckpt, epoch):
+        with open(os.path.join(self.out, "index.json"), "w") as f:
+            json.dump(dict(ckpt=ckpt, epoch=epoch, cells=self.cfg["cells"], cell_m=self.cfg["cell_m"],
+                           crops=self.rows), f, indent=1)
+        print(f"probability maps of {len(self.rows)} crops -> {self.out}")
 
 
 # ------------------------------------------------------------------ self-test
@@ -874,6 +919,8 @@ def parser():
                    help="val / train = that run's own scene split (config.json next to --ckpt)")
     p.add_argument("--collage-n", type=int, default=8, help="crops per collage with --score-thrs (0 = none)")
     p.add_argument("--collage-pixel-m", type=float, default=2.0)
+    p.add_argument("--save-heat", default=None,
+                   help="folder: save every crop's probability map (+ geo, ground truth) as <scene>/<crop_id>.npz")
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--workers", type=int, default=4)
     s = sub.add_parser("selftest")
