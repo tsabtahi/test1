@@ -18,7 +18,8 @@ Scores against the crop's ground truth (ignored ships neither hit nor miss):
 Also: for every ship, the highest heat inside its box -> how many missed ships have activation at all.
 
 Outputs in --out: table.csv, regions_<method>_thr<t>.geojson (detections in lat/lon), gt_heat.csv (per ship),
-and --png-n example images (heat map, regions outlined, ground truth green).
+and --png-n example images per method: SAR image | image + ships + detections | probability map + boxes
+(the SAR image needs predict --save-heat with --save-image-m > 0, the default 2 m).
 
     python heat_regions.py --heat /runs/fourier_adj_fixed/heat_val --out /runs/fourier_adj_fixed/heat_val_regions
 Needs numpy, scipy, pillow.
@@ -37,7 +38,9 @@ def load(heat_dir):
         yield dict(path=p, scene=os.path.basename(os.path.dirname(p)), crop_id=os.path.basename(p)[:-4],
                    heat=z["heat"].astype(np.float32), off=z["off"].astype(np.float32), size=z["size"].astype(np.float32),
                    gt=z["gt_boxes"].reshape(-1, 4), ign=z["gt_ignore"].astype(bool), lat=float(z["lat"]),
-                   lon=float(z["lon"]), cm=float(z["cell_m"]), cells=int(z["cells"]), geo=z["geo"])
+                   lon=float(z["lon"]), cm=float(z["cell_m"]), cells=int(z["cells"]), geo=z["geo"],
+                   image=z["image"] if "image" in z.files else None,
+                   image_m=float(z["image_m"]) if "image_m" in z.files else None)
 
 
 def cell_xy(r, c, cm, cells):
@@ -186,23 +189,47 @@ def to_geo(cr, box):
 
 
 # ------------------------------------------------------------------ pictures
-def png(cr, dets, path, scale=4):
+def png(cr, dets, path, title="", size=512):
+    """Three panels, same extent, north up: SAR image | SAR image + ships (green, yellow = ignored) + detections (red,
+    with score) | probability map + the same boxes. Without a stored image: the map panel only."""
     from PIL import Image, ImageDraw
-    h = np.clip(cr["heat"] / max(cr["heat"].max(), 0.05), 0, 1)
-    rgb = np.stack([h * 255, h * 80, (1 - h) * 160 + 40], -1).astype(np.uint8)
-    im = Image.fromarray(rgb).resize((cr["cells"] * scale,) * 2, Image.NEAREST)
-    d = ImageDraw.Draw(im)
     H = cr["cells"] * cr["cm"] / 2
-    px = lambda e, n: ((e + H) / cr["cm"] * scale, (H - n) / cr["cm"] * scale)
-    for g, ig in zip(cr["gt"], cr["ign"]):
-        d.rectangle([*px(g[0], g[3]), *px(g[2], g[1])], outline=(255, 230, 0) if ig else (60, 255, 90), width=2)
-    for s, b, (ce, cn) in dets:
-        d.rectangle([*px(b[0], b[3]), *px(b[2], b[1])], outline=(255, 255, 255), width=1)
-        x, y = px(ce, cn)
-        d.ellipse([x - 3, y - 3, x + 3, y + 3], outline=(255, 255, 255))
-        d.text((x + 4, y - 10), f"{s:.2f}", fill=(255, 255, 255))
-    d.text((4, 4), f"{cr['crop_id']}  max {cr['heat'].max():.2f}", fill=(255, 255, 255))
-    im.save(path)
+    s = size / (2 * H)                                            # screen pixels per metre
+    px = lambda e, n: ((e + H) * s, (H - n) * s)
+
+    def boxes(im):
+        d = ImageDraw.Draw(im)
+        for g, ig in zip(cr["gt"], cr["ign"]):
+            d.rectangle([*px(g[0], g[3]), *px(g[2], g[1])], outline=(255, 230, 0) if ig else (60, 255, 90), width=2)
+        for sc, b, (ce, cn) in dets:
+            d.rectangle([*px(b[0], b[3]), *px(b[2], b[1])], outline=(255, 50, 50), width=2)
+            x, y = px(ce, cn)
+            d.ellipse([x - 3, y - 3, x + 3, y + 3], outline=(255, 50, 50), width=2)
+            d.text((x + 5, y - 12), f"{sc:.2f}", fill=(255, 90, 90))
+        return im
+
+    vmax = max(0.3, float(cr["heat"].max()))                      # fixed floor: a flat weak map stays dark
+    h = np.clip(cr["heat"] / vmax, 0, 1)
+    rgb = np.stack([np.clip(3 * h, 0, 1), np.clip(3 * h - 1, 0, 1),
+                    np.clip(1 - 3 * h, 0, 1) * 0.6 + np.clip(3 * h - 2, 0, 1)], -1)
+    heat = boxes(Image.fromarray((rgb * 255).astype(np.uint8)).resize((size, size), Image.NEAREST))
+    ImageDraw.Draw(heat).text((4, 4), f"probability 0..{vmax:.2f}, max {cr['heat'].max():.2f}", fill=(255, 255, 255))
+    panels = [heat]
+    if cr.get("image") is not None:
+        sar = Image.fromarray(cr["image"]).convert("RGB").resize((size, size), Image.BILINEAR)
+        raw = sar.copy()
+        ImageDraw.Draw(raw).text((4, 4), f"SAR image ({cr['image_m']:g} m)", fill=(255, 255, 255))
+        lab = boxes(sar)
+        ImageDraw.Draw(lab).text((4, 4), "green = ship, yellow = ignored, red = detection", fill=(255, 255, 255))
+        panels = [raw, lab, heat]
+    W = len(panels) * size + (len(panels) - 1) * 6
+    sheet = Image.new("RGB", (W, size + 20), (25, 25, 25))
+    for k, pnl in enumerate(panels):
+        sheet.paste(pnl, (k * (size + 6), 20))
+    n_gt = int((~cr["ign"]).sum())
+    ImageDraw.Draw(sheet).text((4, 4), f"{cr['crop_id']}   ships {n_gt}   detections {len(dets)}   {title}",
+                               fill=(230, 230, 230))
+    sheet.save(path)
 
 
 def main():
@@ -265,9 +292,9 @@ def main():
         os.makedirs(os.path.join(a.out, "png"), exist_ok=True)
         pick = sorted(crops, key=lambda c: -int((~c["ign"]).sum()))[:a.png_n]
         for c in pick:
-            png(c, regions(c, a.png_thr, a, True), os.path.join(a.out, "png", f"{c['crop_id']}_watershed.png"))
-            png(c, regions(c, a.png_thr, a, True, True), os.path.join(a.out, "png", f"{c['crop_id']}_watershed_size.png"))
-            png(c, peaks(c, a.png_thr), os.path.join(a.out, "png", f"{c['crop_id']}_peaks.png"))
+            for meth in a.methods:
+                png(c, fn[meth](c, a.png_thr), os.path.join(a.out, "png", f"{c['crop_id']}_{meth}.png"),
+                    f"{meth}, threshold {a.png_thr:g}")
     print(f"-> {a.out}: table.csv, gt_heat.csv, regions_<method>_thr<t>.geojson" + (", png/" if a.png_n else ""))
 
 
