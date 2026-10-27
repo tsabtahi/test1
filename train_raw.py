@@ -200,7 +200,7 @@ def td_enu(lat, lon):
             np.array([math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la)]))
 
 
-TENSORS = ("X", "u", "f0", "scss", "E", "N", "heat", "ign", "idx", "off", "size", "box", "mask")
+TENSORS = ("X", "u", "f0", "scss", "E", "N", "heat", "ign", "idx", "off", "size", "box", "mask", "tx", "rc")
 
 
 def collate(items):
@@ -680,7 +680,7 @@ def predict(a):
     ds = RawSet(a.crops, entries, td.load_scene_annotations(a.ann_root), cfg, train=False)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, num_workers=a.workers, collate_fn=collate)
     thrs = sorted(a.score_thrs) if a.score_thrs else [a.score_thr]
-    keep = HeatSaver(a.save_heat, cfg) if a.save_heat else None
+    keep = HeatSaver(a.save_heat, cfg, ds, a.save_image_m, device) if a.save_heat else None
     m0, records = evaluate(model, dl, device, cfg, thrs[0], min_score=min(thrs), keep=keep)   # one pass, all thresholds
     if keep is not None:
         keep.close(a.ckpt, st.get("epoch"))
@@ -734,10 +734,33 @@ class HeatSaver:
       gt_boxes    (K, 4) crop-local metres [e0, n0, e1, n1] (east / north of the crop centre), gt_ignore (K,)
       lat, lon    crop centre; cell_m, cells
       geo         [lon_w, lat_n, dlon, dlat]: cell (r, c) covers lon_w + c*dlon .. +dlon, lat_n - r*dlat .. -dlat
+      image       (n, n) uint8 SAR amplitude, dB above the crop median from -5 (0) to 35 (255), north up, pixel image_m
+                  (same extent as heat; with --save-image-m > 0)
     index.json lists every file."""
-    def __init__(self, out, cfg):
+    def __init__(self, out, cfg, ds=None, image_m=0.0, device=None):
         self.out, self.cfg, self.rows = out, cfg, []
+        self.image_m, self.device = image_m, device
+        self.h_ref = {m["crop_id"]: float(m.get("h_ref", 0.0)) for m in (ds.meta if ds is not None else [])}
         os.makedirs(out, exist_ok=True)
+
+    @torch.no_grad()
+    def image(self, b, i):
+        """SAR amplitude of crop i of the batch on its north-up grid (as the collage), uint8 = dB above median -5..35."""
+        H = self.cfg["cells"] * self.cfg["cell_m"] / 2
+        n = int(round(2 * H / self.image_m))
+        lat, lon = float(b["lat"][i]), float(b["lon"][i])
+        h_ref = self.h_ref.get(b["crop_id"][i], 0.0)
+        g = td.make_grid(lat, lon, n, self.image_m)
+        pix = torch.from_numpy(td.grid_pixels_ecef(g, h_ref, td.llh_to_ecef(lat, lon, h_ref)))[None].to(self.device)
+        P, S = b["X"].shape[1:]
+        im = td.Imager(P, S, n_sub=1, oversample=2, chunk_elems=8e6, learn_taper=False).to(self.device)
+        im.w_p.data = torch.hann_window(P, periodic=False, device=self.device)
+        im.w_s.data = torch.hann_window(S, periodic=False, device=self.device)
+        re, ii = im(b["X"][i:i + 1], b["tx"][i:i + 1], b["rc"][i:i + 1], b["f0"][i:i + 1], b["scss"][i:i + 1],
+                    torch.tensor([-1], device=self.device), pix)
+        amp = torch.sqrt(re[0, 0] ** 2 + ii[0, 0] ** 2).reshape(n, n).float().cpu().numpy()
+        db = 20 * np.log10(np.maximum(amp, 1e-30) / max(float(np.median(amp)), 1e-30))
+        return np.clip((db + 5) / 40 * 255, 0, 255).astype(np.uint8)
 
     def __call__(self, out, b):
         heat = torch.sigmoid(out["heat"][:, 0]).float().cpu().numpy()
@@ -751,7 +774,13 @@ class HeatSaver:
             d = os.path.join(self.out, b["scene"][i])
             os.makedirs(d, exist_ok=True)
             p = os.path.join(d, b["crop_id"][i] + ".npz")
-            np.savez_compressed(p, heat=heat[i].astype(np.float32), off=off[i].astype(np.float16),
+            extra = {}
+            if self.image_m > 0:
+                try:
+                    extra = dict(image=self.image(b, i), image_m=self.image_m)
+                except Exception as e:                  # keep the maps even if imaging fails
+                    print(f"  image of {b['crop_id'][i]} failed ({type(e).__name__}: {e})")
+            np.savez_compressed(p, **extra, heat=heat[i].astype(np.float32), off=off[i].astype(np.float16),
                                 size=size[i].astype(np.float16), gt_boxes=np.asarray(b["gt"][i], np.float32),
                                 gt_ignore=np.asarray(b["gt_ignore"][i], bool), lat=lat, lon=lon, cell_m=cm, cells=cells,
                                 geo=np.array(geo))
@@ -919,6 +948,8 @@ def parser():
                    help="val / train = that run's own scene split (config.json next to --ckpt)")
     p.add_argument("--collage-n", type=int, default=8, help="crops per collage with --score-thrs (0 = none)")
     p.add_argument("--collage-pixel-m", type=float, default=2.0)
+    p.add_argument("--save-image-m", type=float, default=2.0,
+                   help="with --save-heat: also store the SAR image of each crop at this pixel size, m (0 = no image)")
     p.add_argument("--save-heat", default=None,
                    help="folder: save every crop's probability map (+ geo, ground truth) as <scene>/<crop_id>.npz")
     p.add_argument("--batch", type=int, default=8)
