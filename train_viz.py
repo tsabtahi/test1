@@ -123,7 +123,10 @@ class Collage:
 
     @torch.no_grad()
     def _image(self, it, chunk_elems):
+        m = self.ds.meta[self.ds.entries.index(next(e for e in self.ds.entries if e["json"].endswith(it["crop_id"] + ".json")))] \
+            if False else None                                        # (meta not needed: centre and height are in the item)
         g = td.make_grid(it["lat"], it["lon"], self.n, self.px)
+        h = self.ds.meta[self.items.index(it) if False else 0]["h_ref"] if False else None
         h_ref = self._h_ref(it)
         centre = td.llh_to_ecef(it["lat"], it["lon"], h_ref)
         pix = torch.from_numpy(td.grid_pixels_ecef(g, h_ref, centre))[None].to(self.device)
@@ -152,11 +155,18 @@ class Collage:
         was = core.training
         core.eval()
         tiles = []
+        self._has_heat = True
         for it, img in zip(self.items, self.images):
             b = to_device(collate([it]), self.device)
             out = core(b)
             (sc, bx), = decode(out, self.cfg, thr=score_thr)
-            heat = torch.sigmoid(out["heat"][0, 0]).float().cpu().numpy()
+            if "heat" in out:
+                heat = torch.sigmoid(out["heat"][0, 0]).float().cpu().numpy()
+            else:                                                   # detector: show its input (log power channel)
+                self._has_heat = False
+                im0 = out["image"][0, 0].float().cpu().numpy()
+                lo, hi = np.percentile(im0, [2, 99.8])
+                heat = np.clip((im0 - lo) / max(hi - lo, 1e-6), 0, 1)
             left = Image.fromarray(img).convert("RGB")
             d = ImageDraw.Draw(left)
             for gb, ig in zip(it["gt"], it["gt_ignore"]):
@@ -172,7 +182,8 @@ class Collage:
                     cx, cy = (gb[0] + gb[2]) / 2, (gb[1] + gb[3]) / 2
                     x, y = (cx + self.H) / self.px, (self.H - cy) / self.px
                     dr.ellipse([x - 4, y - 4, x + 4, y + 4], outline=(0, 255, 0), width=2)
-            dr.text((3, 3), f"max {heat.max():.2f}", fill=(255, 255, 255))
+            if "heat" in out:
+                dr.text((3, 3), f"max {heat.max():.2f}", fill=(255, 255, 255))
             tile = Image.new("RGB", (2 * self.n + 4, self.n + 16), (0, 0, 0))
             tile.paste(left, (0, 16)); tile.paste(right, (self.n + 4, 16))
             ImageDraw.Draw(tile).text((3, 2), f"{it['crop_id'][-28:]}  ships {int((~it['gt_ignore']).sum())}  pred {len(sc)}",
@@ -183,7 +194,7 @@ class Collage:
         W, Hh = tiles[0].size
         sheet = Image.new("RGB", (cols * W + (cols - 1) * 6, rows * Hh + (rows - 1) * 6 + 22), (30, 30, 30))
         ImageDraw.Draw(sheet).text((4, 4), f"epoch {epoch}: green = ship, yellow = ignored, red = predicted (score >= {score_thr}); "
-                                            f"right = heat map", fill=(255, 255, 255))
+                                            f"right = {'heat map' if self._has_heat else 'detector input (log power)'}", fill=(255, 255, 255))
         for i, t in enumerate(tiles):
             sheet.paste(t, ((i % cols) * (W + 6), 22 + (i // cols) * (Hh + 6)))
         if was:

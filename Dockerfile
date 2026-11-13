@@ -14,6 +14,7 @@
 #       --entrypoint torchrun cphd-gpu --nproc_per_node=4 /app/train_detector.py train \
 #       --crops /crops --ann-root /ann --out /runs/r1
 #   raw phase-history model: same line with /app/train_raw.py in place of /app/train_detector.py
+#   standard detector on the Fourier features: train_raw.py ... --arch det --detector fasterrcnn|retinanet|fcos
 #
 # Box adjust web page (then on the laptop: ssh -L 8765:localhost:8765 tabtahi@geohub3, open http://localhost:8765):
 #   mkdir -p /home/tabtahi/SATLOCK/dataset/annotations_adjusted
@@ -35,10 +36,13 @@ RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/c
 
 RUN pip install tensorboard
 
+# ResNet-34 ImageNet weights for train_raw.py --arch det --det-backbone resnet34 (own layer: the one above stays cached)
+RUN python -c "import torchvision; torchvision.models.resnet34(weights='DEFAULT')" && chmod -R a+rX /app/torch
+
 # writable caches for any --user (CuPy kernel cache, matplotlib); after the pip layer so it stays cached
 ENV HOME=/tmp CUPY_CACHE_DIR=/tmp/cupy_cache MPLCONFIGDIR=/tmp/matplotlib
 
 WORKDIR /app
-COPY build_crops.py train_detector.py train_raw.py train_viz.py fourier_net.py png_output.py box_adjust_server.py heat_regions.py /app/
+COPY build_crops.py train_detector.py train_raw.py train_viz.py fourier_net.py det_net.py png_output.py box_adjust_server.py heat_regions.py /app/
 ENTRYPOINT ["python"]
 CMD ["/app/train_detector.py", "--help"]

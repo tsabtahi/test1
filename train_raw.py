@@ -35,6 +35,7 @@ import torch.distributed as dist
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import train_detector as td                                           # data reading, sampler, metrics, GeoJSON
 from fourier_net import FourierShipNet
+from det_net import DetShipNet, CHANNELS as DET_CHANNELS
 import train_viz as tv                                                # dataset stats, TensorBoard, collages
 
 C = 299792458.0
@@ -315,6 +316,8 @@ def decode_at(off, size, idx, cells, cell_m):
 
 
 def compute_loss(out, b, cfg):
+    if "det_losses" in out:                             # --arch det: the detector computes its own losses
+        return out["det_losses"]
     """CenterNet losses. With --tol-m R > 0 the position only has to be right to within R metres (labels that may be
     shifted by tens of metres, e.g. a height / alignment offset between the image and the GEC boxes):
       heat    the positive term scores the BEST cell within R of each ship centre (multiple-instance), and every cell
@@ -359,6 +362,12 @@ def compute_loss(out, b, cfg):
 @torch.no_grad()
 def decode(out, cfg, k=100, thr=0.05):
     """Peaks of the heat map -> boxes in crop-local metres [e0, n0, e1, n1] and scores, per crop."""
+    if "dets" in out:                                   # --arch det: boxes already in metres, after NMS
+        res = []
+        for s, bx in out["dets"]:
+            keep = torch.nonzero(s >= thr).flatten()[:k]
+            res.append((s[keep].cpu().numpy(), bx[keep].cpu().numpy()))
+        return res
     heat = torch.sigmoid(out["heat"][:, 0])
     peak = heat == F.max_pool2d(heat[:, None], 3, 1, 1)[:, 0]
     sc, idx = (heat * peak).flatten(1).topk(min(k, heat[0].numel()), dim=1)
@@ -457,11 +466,15 @@ def cfg_of(a):
                 pulses=a.pulses, samples=a.samples, patch=a.patch, dim=a.dim, depth=a.depth, heads=a.heads,
                 dec_dim=a.dec_dim, dec_heads=a.dec_heads, dec_layers=a.dec_layers, giou_weight=a.giou_weight, amp=a.amp, tol_m=a.tol_m,
                 eval_tol_m=a.eval_tol_m, aug=a.aug, aug_p=a.aug_p, aug_min_frac=a.aug_min_frac, aug_snr_db=a.aug_snr_db,
-                arch=a.arch, pretrained=not a.no_pretrained, fixed_dft=a.fixed_dft)
+                arch=a.arch, pretrained=not a.no_pretrained, fixed_dft=a.fixed_dft, detector=a.detector,
+                det_backbone=a.det_backbone, det_pixel_m=a.det_pixel_m, det_channels=a.det_channels)
 
 
 def build_model(cfg):
-    return FourierShipNet(cfg) if cfg.get("arch", "vit") == "fourier" else RawShipNet(cfg)
+    arch = cfg.get("arch", "vit")
+    if arch == "det":
+        return DetShipNet(cfg)
+    return FourierShipNet(cfg) if arch == "fourier" else RawShipNet(cfg)
 
 
 def adjusted_scenes(ann_root):
@@ -551,7 +564,8 @@ def train(a):
     if a.resume:
         model.load_state_dict(torch.load(a.resume, map_location="cpu", weights_only=False)["model"])
     if world > 1:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda" else None)
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda" else None,
+                                                    find_unused_parameters=cfg.get("arch") == "det")
     core = model.module if world > 1 else model
     front = set(id(p) for p in core.front_parameters()) if hasattr(core, "front_parameters") else set()
     groups = [dict(params=[p for p in model.parameters() if id(p) not in front and p.requires_grad])]
@@ -680,6 +694,9 @@ def predict(a):
     ds = RawSet(a.crops, entries, td.load_scene_annotations(a.ann_root), cfg, train=False)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, num_workers=a.workers, collate_fn=collate)
     thrs = sorted(a.score_thrs) if a.score_thrs else [a.score_thr]
+    if a.save_heat and cfg.get("arch") == "det":
+        print("--save-heat: --arch det has no probability map (boxes come from the detector); skipped")
+        a.save_heat = None
     keep = HeatSaver(a.save_heat, cfg, ds, a.save_image_m, device) if a.save_heat else None
     m0, records = evaluate(model, dl, device, cfg, thrs[0], min_score=min(thrs), keep=keep)   # one pass, all thresholds
     if keep is not None:
@@ -930,8 +947,16 @@ def parser():
     t.add_argument("--aug-p", type=float, default=0.5, help="probability of each augmentation")
     t.add_argument("--aug-min-frac", type=float, default=0.6, help="shortest kept run of pulses / frequencies")
     t.add_argument("--aug-snr-db", type=float, default=0.0, help="lowest SNR of the added noise, dB")
-    t.add_argument("--arch", choices=["vit", "fourier"], default="fourier",
-                   help="fourier: learnable DFT front end + CNN (default); vit: patch ViT encoder + cell decoder")
+    t.add_argument("--detector", choices=["fasterrcnn", "retinanet", "fcos"], default="fasterrcnn",
+                   help="det: which torchvision detector")
+    t.add_argument("--det-backbone", choices=["resnet18", "resnet34", "resnet50"], default="resnet50",
+                   help="det: ResNet-FPN backbone (ImageNet weights unless --no-pretrained)")
+    t.add_argument("--det-pixel-m", type=float, default=1.0, help="det: pixel of the north-up feature image, m")
+    t.add_argument("--det-channels", nargs="*", choices=list(DET_CHANNELS), default=list(DET_CHANNELS),
+                   help="det: feature channels given to the detector (default all five)")
+    t.add_argument("--arch", choices=["vit", "fourier", "det"], default="fourier",
+                   help="fourier: learnable DFT front end + CNN (default); det: the same front end + a standard "
+                        "detector (Faster R-CNN / RetinaNet / FCOS, see --detector); vit: patch ViT encoder + cell decoder")
     t.add_argument("--no-pretrained", action="store_true", help="fourier: ResNet-18 stem from scratch")
     t.add_argument("--fixed-dft", action="store_true", help="fourier: keep the transform and taper fixed")
     t.add_argument("--front-lr-scale", type=float, default=0.1, help="fourier: learning-rate factor for the transform")
