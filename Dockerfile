@@ -23,6 +23,11 @@
 #       -v /home/tabtahi/SATLOCK/dataset/annotations_adjusted:/ann_adj \
 #       -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops \
 #       cphd-gpu /app/box_adjust_server.py --crops /crops --ann-root /ann --ann-out /ann_adj --host 0.0.0.0 --device cuda:0
+# Layer viewer (every stage of a trained model, plus ship-vs-background separation per layer on the val set):
+#   docker run -d --name layers --gpus '"device=1"' --ipc=host --user $(id -u):$(id -g) -e HOME=/tmp -p 127.0.0.1:8770:8770 \
+#       -v /home/tabtahi/SATLOCK/dataset/annotations_adjusted:/ann:ro -v /home/tabtahi/SATLOCK/dataset/cphd_crops:/crops:ro \
+#       -v /home/tabtahi/SATLOCK/runs:/runs cphd-gpu /app/layer_viewer.py --ckpt /runs/det_frcnn/best.pt \
+#       --crops /crops --ann-root /ann --split val --host 0.0.0.0
 # Python 3.12 (sarkit 1.12 needs >= 3.12). The PyTorch CUDA 12.6 wheels bring their own CUDA libraries; the host only
 # needs an NVIDIA driver (CUDA 12.x, driver >= 525) and the NVIDIA container toolkit (docker run --gpus all).
 FROM python:3.12-slim
@@ -43,6 +48,6 @@ RUN python -c "import torchvision; torchvision.models.resnet34(weights='DEFAULT'
 ENV HOME=/tmp CUPY_CACHE_DIR=/tmp/cupy_cache MPLCONFIGDIR=/tmp/matplotlib
 
 WORKDIR /app
-COPY build_crops.py train_detector.py train_raw.py train_viz.py fourier_net.py det_net.py png_output.py box_adjust_server.py heat_regions.py /app/
+COPY build_crops.py train_detector.py train_raw.py train_viz.py fourier_net.py det_net.py png_output.py box_adjust_server.py heat_regions.py layer_viewer.py /app/
 ENTRYPOINT ["python"]
 CMD ["/app/train_detector.py", "--help"]
